@@ -529,8 +529,9 @@ void App::HandleCanvasInput(bool hovered) {
             if (formPage >= 0) { doc.KillFormFocus(); InvalidatePage(formPage); formPage = -1; }
             switch (tool) {
             case Tool::Select: {
-                // If clicking inside the current multi/group selection, keep it and drag the whole set.
-                bool insideGroup = groupSel.size() > 1 && sel.Valid(doc) && sel.page == page &&
+                // Clicking inside the current group keeps the whole set (drag it as one),
+                // unless Alt is held - then pick the single line under the cursor instead.
+                bool insideGroup = !io.KeyAlt && groupSel.size() > 1 && sel.Valid(doc) && sel.page == page &&
                                    SelectionBounds().Contains(px, py);
                 if (!insideGroup) {
                     SelectObjectAt(page, px, py);
@@ -658,15 +659,23 @@ void App::HandleCanvasInput(bool hovered) {
         dragging = false; dragMode = 0; dragPage = -1;
     }
 
-    // ---- double-click: edit text in place ----
+    // ---- double-click: edit text, or pick one line out of a group ----
     if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && over && tool == Tool::Select) {
-        auto hit = ops::HitTest(doc, page, px, py);
+        auto hit = ops::HitTest(doc, page, px, py, 4.0f / std::max(0.05f, zoom));
         if (hit && hit->type == FPDF_PAGEOBJ_TEXT) {
             ops::TextProps tp = ops::ReadText(doc, page, hit->obj);
             sel.Set(doc, page, *hit);
             EnsureSelectionEditable();                 // flatten group so the text edit persists
             editing = true; editIsNew = false; editPage = page; editObj = sel.obj;
             editBuf = W2U(tp.text);
+        } else if (hit) {
+            // Select just this one line/member (it keeps its group tag, so the group
+            // stays intact) - now you can nudge it alone to change the spacing.
+            sel.Set(doc, page, *hit);
+            groupSel = { sel.obj };
+            selGroupId = 0;
+            if (ops::GetGroupId(sel.obj))
+                Toasts("Editing one line - drag it or use arrow keys; it stays in the group");
         }
     }
 

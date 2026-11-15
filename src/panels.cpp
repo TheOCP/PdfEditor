@@ -277,6 +277,7 @@ void App::DrawProperties() {
             if (xe || ye) { MoveSelection(left - b.l, bottom - b.b); CommitIfDirty("Move group"); }
             ImGui::Text("Size: %.1f x %.1f pt", b.W(), b.H());
             ImGui::TextDisabled("Arrows move - Alt+arrows / handles resize all together");
+            ImGui::TextDisabled("Alt+click or double-click one line to nudge it alone (stays grouped)");
             ImGui::Separator();
             if (selGroupId) {
                 if (ImGui::Button("Ungroup (separate lines)")) UngroupSelection();

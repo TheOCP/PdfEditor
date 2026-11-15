@@ -148,6 +148,14 @@ int RunSelfTest() {
         Check(tagged > 0, "tagged the table lines with a group id");
         Check((int)ops::GroupMembers(g, 0, gid).size() == tagged, "GroupMembers returns every tagged line");
         Check(ops::MaxGroupId(g) == gid, "MaxGroupId finds the id");
+        // move ONE member on its own - it must stay in the group (tag kept).
+        FPDF_PAGEOBJECT one = ops::GroupMembers(g, 0, gid)[1];
+        PRect obefore = ops::ObjectBounds(one);
+        FS_MATRIX idm{ 1, 0, 0, 1, 0, 0 };
+        ops::TranslateObjectPage(g, 0, one, idm, 0, -20);
+        Check(ops::GetGroupId(one) == gid, "a single line keeps its group tag after moving");
+        Check((int)ops::GroupMembers(g, 0, gid).size() == tagged, "group still has all its lines");
+        Check(std::fabs(ops::ObjectBounds(one).b - (obefore.b - 20)) < 0.5f, "that line actually moved");
         g.Commit("group");
         Bytes gb; g.SaveBytes(gb, 0);
         Document gr; std::string ge;
