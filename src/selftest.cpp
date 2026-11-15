@@ -112,6 +112,30 @@ int RunSelfTest() {
         Check(grew, "resize persisted through save + reload");
     }
 
+    // ---- group resize keeps the grid aligned ----
+    Out("\nGroup resize stays perfect:\n");
+    {
+        Document q;
+        q.CreateBlank(612, 792);
+        ops::AddTable(q, 0, { 54, 54, 558, 738 }, 4, 2, true, 24, 0, 0, 0, 1.0f);
+        q.Bake();
+        std::vector<FPDF_PAGEOBJECT> lines;
+        for (auto& o : ops::ListObjects(q, 0)) if (o.type == FPDF_PAGEOBJ_PATH) lines.push_back(o.obj);
+        Check(lines.size() >= 8, "table produced the frame lines");
+        PRect cur = ops::ObjectBounds(lines[0]);
+        for (size_t i = 1; i < lines.size(); ++i) cur = cur.Union(ops::ObjectBounds(lines[i]));
+        // non-uniform resize (wider + shorter), as a handle drag would do
+        PRect target{ cur.l + 10, cur.b + 10, cur.l + 10 + cur.W() * 1.5f, cur.b + 10 + cur.H() * 0.7f };
+        float sx = target.W() / cur.W(), sy = target.H() / cur.H();
+        FS_MATRIX m{ sx, 0, 0, sy, target.l - cur.l * sx, target.b - cur.b * sy };
+        for (auto o : lines) ops::TransformObjectPage(q, 0, o, m);
+        PRect nu = ops::ObjectBounds(lines[0]);
+        for (size_t i = 1; i < lines.size(); ++i) nu = nu.Union(ops::ObjectBounds(lines[i]));
+        bool exact = std::fabs(nu.l - target.l) < 0.5f && std::fabs(nu.b - target.b) < 0.5f &&
+                     std::fabs(nu.r - target.r) < 0.5f && std::fabs(nu.t - target.t) < 0.5f;
+        Check(exact, "resized frame lands exactly on the target (lines stay a clean grid)");
+    }
+
     // ---- grouping tags persist through save/reload ----
     Out("\nGrouping (tag survives save/reload):\n");
     {

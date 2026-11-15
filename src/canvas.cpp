@@ -70,6 +70,32 @@ bool App::EnsureSelectionEditable() {
 
 // ------------------------------------------------------- multi-select / groups
 
+void App::SelectAllOnPage(bool linesOnly) {
+    if (doc.PageCount() == 0) return;
+    int pg = currentPage;
+    groupSel.clear(); selGroupId = 0; sel.Clear();
+    int common = -1; bool sameGroup = true;
+    for (auto& o : ops::ListObjects(doc, pg)) {
+        if (o.parent) continue;                          // top-level only
+        if (linesOnly && o.type != FPDF_PAGEOBJ_PATH) continue;
+        groupSel.push_back(o.obj);
+        int gid = ops::GetGroupId(o.obj);
+        if (common == -1) common = gid; else if (common != gid) sameGroup = false;
+    }
+    if (groupSel.empty()) { Toasts(linesOnly ? "No lines on this page" : "Nothing on this page", true); return; }
+    ops::ObjInfo first;
+    first.obj = groupSel[0]; first.parent = nullptr; first.bounds = ops::ObjectBounds(groupSel[0]);
+    sel.Set(doc, pg, first);
+    selGroupId = (sameGroup && common > 0) ? common : 0;
+    Toasts(Fmt("Selected %d %s", (int)groupSel.size(), linesOnly ? "line(s)" : "object(s)"));
+}
+
+void App::GroupAllLines() {
+    SelectAllOnPage(true);
+    if (groupSel.size() >= 2 && !selGroupId) GroupSelection();
+    else if (selGroupId) Toasts("These lines are already a group");
+}
+
 void App::RefreshGroupSel() {
     groupSel.clear();
     selGroupId = 0;
@@ -647,24 +673,7 @@ void App::HandleCanvasInput(bool hovered) {
     // ---- Escape clears the selection; Ctrl+A selects everything on the page ----
     if (!editing && formPage < 0) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { sel.Clear(); groupSel.clear(); selGroupId = 0; }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) && doc.PageCount() > 0) {
-            int pg = currentPage;
-            groupSel.clear(); selGroupId = 0; sel.Clear();
-            int common = -1; bool sameGroup = true;
-            for (auto& o : ops::ListObjects(doc, pg)) {
-                if (o.parent) continue;
-                groupSel.push_back(o.obj);
-                int gid = ops::GetGroupId(o.obj);
-                if (common == -1) common = gid; else if (common != gid) sameGroup = false;
-            }
-            if (!groupSel.empty()) {
-                ops::ObjInfo first;
-                first.obj = groupSel[0]; first.parent = nullptr; first.bounds = ops::ObjectBounds(groupSel[0]);
-                sel.Set(doc, pg, first);
-                selGroupId = (sameGroup && common > 0) ? common : 0;
-                Toasts(Fmt("Selected %d objects on this page", (int)groupSel.size()));
-            }
-        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) SelectAllOnPage(io.KeyShift);  // Shift = lines only
     }
 
     // ---- object context menu (right-click) ----

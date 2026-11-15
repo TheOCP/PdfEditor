@@ -185,6 +185,11 @@ public:
     bool EnsureSelectionEditable();
 
     // --- multi-selection / grouping ---
+    // Select every top-level object on the current page; linesOnly restricts to
+    // path/line objects (skips text and images) so a table frame can be grouped
+    // and resized without dragging its text along.
+    void SelectAllOnPage(bool linesOnly);
+    void GroupAllLines();                   // select all lines + group in one step
     void RefreshGroupSel();                 // rebuild groupSel from sel (whole group if grouped)
     PRect SelectionBounds();                // union page bounds of groupSel
     void MoveSelection(float dxPage, float dyPage);

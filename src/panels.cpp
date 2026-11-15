@@ -32,11 +32,15 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, doc.CanUndo())) Undo();
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, doc.CanRedo())) Redo();
         ImGui::Separator();
-        if (ImGui::MenuItem("Delete selected", "Del", false, sel.Valid(doc))) {
-            int pg = sel.page;
-            EnsureSelectionEditable();
-            if (ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent)) { sel.Clear(); CommitIfDirty("Delete object"); }
-        }
+        if (ImGui::MenuItem("Delete selected", "Del", false, sel.Valid(doc))) DeleteSelection();
+        ImGui::Separator();
+        bool has = doc.Raw() != nullptr;
+        if (ImGui::MenuItem("Select all on page", "Ctrl+A", false, has)) SelectAllOnPage(false);
+        if (ImGui::MenuItem("Select all lines (skip text/images)", "Ctrl+Shift+A", false, has)) SelectAllOnPage(true);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Group all lines on page", nullptr, false, has)) GroupAllLines();
+        if (ImGui::MenuItem("Group selection", nullptr, false, groupSel.size() > 1 && !selGroupId)) GroupSelection();
+        if (ImGui::MenuItem("Ungroup", nullptr, false, selGroupId != 0)) UngroupSelection();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Page")) {
