@@ -54,9 +54,10 @@ void App::CommitIfDirty(const std::string& label) {
 
 void App::NewDoc() {
     if (doc.CreateBlank(612, 792)) {
-        sel.Clear();
+        sel.Clear(); groupSel.clear(); selGroupId = 0;
         editing = false;
         zoom = 1.0f;
+        fitPending = true;
         cache.clear();
         searchHits.clear();
         Toasts("New blank document");
@@ -84,9 +85,10 @@ void App::OpenPath(const std::wstring& path) {
         ErrorBox(hwnd_, L"Could not open this PDF:\n" + U2W(err));
         return;
     }
-    sel.Clear();
+    sel.Clear(); groupSel.clear(); selGroupId = 0;
     editing = false;
     zoom = 1.0f;
+    fitPending = true;
     cache.clear();
     searchHits.clear();
     searchCurrent = -1;
@@ -123,7 +125,7 @@ bool App::SaveAs() {
 
 void App::Undo() {
     if (doc.Undo()) {
-        sel.Clear();
+        sel.Clear(); groupSel.clear(); selGroupId = 0;
         editing = false;
         InvalidateAll();
         searchDirty = true;
@@ -133,7 +135,7 @@ void App::Undo() {
 
 void App::Redo() {
     if (doc.Redo()) {
-        sel.Clear();
+        sel.Clear(); groupSel.clear(); selGroupId = 0;
         editing = false;
         InvalidateAll();
         searchDirty = true;
@@ -150,7 +152,7 @@ void App::DoFlatten() {
         return;
     if (ops::FlattenAll(doc)) {
         CommitIfDirty("Flatten");
-        sel.Clear();
+        sel.Clear(); groupSel.clear(); selGroupId = 0;
         Toasts("Flattened annotations and form fields");
     } else {
         Toasts("Nothing to flatten", true);

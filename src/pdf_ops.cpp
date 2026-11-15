@@ -291,6 +291,14 @@ bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target) {
     return true;   // not nested under any top-level form
 }
 
+bool ExplodeForm(Document& d, int page, FPDF_PAGEOBJECT form) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p || !form || FPDFPageObj_GetType(form) != FPDF_PAGEOBJ_FORM) return false;
+    ExplodeFormToPage(p, form);
+    d.ContentChanged(page);
+    return true;
+}
+
 // ------------------------------------------------------------------- images
 
 FPDF_PAGEOBJECT AddImage(Document& d, int page, const Image& img, float px, float py, float widthPt,
@@ -407,6 +415,76 @@ void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, uns
     FPDFPageObj_SetStrokeColor(obj, r, g, b, 255);
     if (width > 0) FPDFPageObj_SetStrokeWidth(obj, width);
     d.ContentChanged(page);
+}
+
+void TransformObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& m) {
+    if (!obj) return;
+    FPDFPageObj_Transform(obj, m.a, m.b, m.c, m.d, m.e, m.f);
+    d.ContentChanged(page);
+}
+
+// ---- grouping (persistent "PEGroup"/id content-mark tag) -------------------
+
+static bool MarkIsGroup(FPDF_PAGEOBJECTMARK mark) {
+    unsigned long n = 0;
+    unsigned short buf[16] = { 0 };
+    if (!FPDFPageObjMark_GetName(mark, buf, sizeof(buf), &n)) return false;
+    std::wstring name(reinterpret_cast<wchar_t*>(buf));
+    return name == L"PEGroup";
+}
+
+int GetGroupId(FPDF_PAGEOBJECT obj) {
+    if (!obj) return 0;
+    int n = FPDFPageObj_CountMarks(obj);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECTMARK m = FPDFPageObj_GetMark(obj, (unsigned long)i);
+        if (m && MarkIsGroup(m)) {
+            int v = 0;
+            if (FPDFPageObjMark_GetParamIntValue(m, "id", &v)) return v;
+        }
+    }
+    return 0;
+}
+
+void ClearGroupId(Document& d, int page, FPDF_PAGEOBJECT obj) {
+    if (!obj) return;
+    for (int i = FPDFPageObj_CountMarks(obj) - 1; i >= 0; --i) {
+        FPDF_PAGEOBJECTMARK m = FPDFPageObj_GetMark(obj, (unsigned long)i);
+        if (m && MarkIsGroup(m)) FPDFPageObj_RemoveMark(obj, m);
+    }
+    d.ContentChanged(page);
+}
+
+void SetGroupId(Document& d, int page, FPDF_PAGEOBJECT obj, int id) {
+    if (!obj) return;
+    ClearGroupId(d, page, obj);
+    FPDF_PAGEOBJECTMARK m = FPDFPageObj_AddMark(obj, "PEGroup");
+    if (m) FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "id", id);
+    d.ContentChanged(page);
+}
+
+int MaxGroupId(Document& d) {
+    int mx = 0;
+    for (int pg = 0; pg < d.PageCount(); ++pg) {
+        FPDF_PAGE p = d.Page(pg);
+        if (!p) continue;
+        int n = FPDFPage_CountObjects(p);
+        for (int i = 0; i < n; ++i)
+            mx = std::max(mx, GetGroupId(FPDFPage_GetObject(p, i)));
+    }
+    return mx;
+}
+
+std::vector<FPDF_PAGEOBJECT> GroupMembers(Document& d, int page, int id) {
+    std::vector<FPDF_PAGEOBJECT> v;
+    FPDF_PAGE p = d.Page(page);
+    if (!p || id == 0) return v;
+    int n = FPDFPage_CountObjects(p);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECT o = FPDFPage_GetObject(p, i);
+        if (o && GetGroupId(o) == id) v.push_back(o);
+    }
+    return v;
 }
 
 int Redact(Document& d, int page, PRect box, unsigned r, unsigned g, unsigned b) {

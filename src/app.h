@@ -126,6 +126,12 @@ public:
     PRect resizeStart;           // selection page bounds at grab
     bool nudgeDirty = false;     // arrow-key edits pending a commit
 
+    // multi-selection / grouping (all members are top-level objects on sel.page)
+    std::vector<FPDF_PAGEOBJECT> groupSel;
+    int selGroupId = 0;          // >0 if the selection is a saved group
+    bool openObjCtx = false;     // request to open the object context menu
+    PRect marquee;               // marquee rectangle (dragMode 5)
+
     // table / form generator
     bool showTable = false;
     int tableCols = 4;
@@ -177,9 +183,20 @@ public:
     // Promotes a nested selection to a top-level object so edits persist on save.
     // Returns true if the selection is editable afterwards.
     bool EnsureSelectionEditable();
+
+    // --- multi-selection / grouping ---
+    void RefreshGroupSel();                 // rebuild groupSel from sel (whole group if grouped)
+    PRect SelectionBounds();                // union page bounds of groupSel
+    void MoveSelection(float dxPage, float dyPage);
+    void ResizeSelectionTo(PRect target);   // scales all members about current bounds
+    void DeleteSelection();
+    void GroupSelection();                  // tag all members with one new group id
+    void UngroupSelection();                // clear the tag (or explode a Form XObject)
+    bool SelectionIsGrouped() const { return selGroupId != 0; }
     void SelectNewObject(int pg, FPDF_PAGEOBJECT o) {
         sel.page = pg; sel.obj = o; sel.parent = nullptr;
         sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();
+        groupSel.assign(1, o); selGroupId = 0;
     }
     void CommitIfDirty(const std::string& label);
     void ForwardFormKey(int vk, bool down);

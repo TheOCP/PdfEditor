@@ -68,6 +68,97 @@ bool App::EnsureSelectionEditable() {
     return sel.Valid(doc);
 }
 
+// ------------------------------------------------------- multi-select / groups
+
+void App::RefreshGroupSel() {
+    groupSel.clear();
+    selGroupId = 0;
+    if (!sel.Valid(doc)) return;
+    if (!sel.parent) {
+        int gid = ops::GetGroupId(sel.obj);
+        if (gid) { selGroupId = gid; groupSel = ops::GroupMembers(doc, sel.page, gid); }
+    }
+    if (groupSel.empty()) groupSel.push_back(sel.obj);
+}
+
+PRect App::SelectionBounds() {
+    if (groupSel.size() <= 1) return sel.PageBounds();
+    PRect u = ops::ObjectBounds(groupSel[0]);
+    for (size_t i = 1; i < groupSel.size(); ++i) u = u.Union(ops::ObjectBounds(groupSel[i]));
+    return u;
+}
+
+void App::MoveSelection(float dx, float dy) {
+    if (!sel.Valid(doc)) return;
+    if (groupSel.size() <= 1) {
+        if (sel.parent) EnsureSelectionEditable();
+        ops::TranslateObjectPage(doc, sel.page, sel.obj, sel.accum, dx, dy);
+    } else {
+        FS_MATRIX id{ 1, 0, 0, 1, 0, 0 };
+        for (auto o : groupSel) ops::TranslateObjectPage(doc, sel.page, o, id, dx, dy);
+    }
+    InvalidatePage(sel.page);
+}
+
+void App::ResizeSelectionTo(PRect target) {
+    if (!sel.Valid(doc)) return;
+    if (groupSel.size() <= 1) {
+        if (sel.parent) EnsureSelectionEditable();
+        ops::ResizeObjectPageTopLevel(doc, sel.page, sel.obj, target);
+        InvalidatePage(sel.page);
+        return;
+    }
+    PRect cur = SelectionBounds();
+    float sx = (cur.W() > 0.5f && target.W() > 0) ? target.W() / cur.W() : 1.0f;
+    float sy = (cur.H() > 0.5f && target.H() > 0) ? target.H() / cur.H() : 1.0f;
+    FS_MATRIX m{ sx, 0, 0, sy, target.l - cur.l * sx, target.b - cur.b * sy };
+    for (auto o : groupSel) ops::TransformObjectPage(doc, sel.page, o, m);
+    InvalidatePage(sel.page);
+}
+
+void App::DeleteSelection() {
+    if (!sel.Valid(doc)) return;
+    int pg = sel.page;
+    if (groupSel.size() <= 1) {
+        EnsureSelectionEditable();
+        ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent);
+    } else {
+        for (auto o : groupSel) ops::DeleteObjectNested(doc, pg, o, nullptr);
+    }
+    sel.Clear(); groupSel.clear(); selGroupId = 0;
+    CommitIfDirty("Delete");
+}
+
+void App::GroupSelection() {
+    if (groupSel.size() < 2 || !sel.Valid(doc)) return;
+    int pg = sel.page;
+    int gid = ops::MaxGroupId(doc) + 1;
+    for (auto o : groupSel) ops::SetGroupId(doc, pg, o, gid);
+    selGroupId = gid;
+    int n = (int)groupSel.size();
+    CommitIfDirty("Group objects");
+    Toasts(Fmt("Grouped %d objects - they now move as one", n));
+}
+
+void App::UngroupSelection() {
+    if (!sel.Valid(doc)) return;
+    int pg = sel.page;
+    if (selGroupId) {
+        for (auto o : ops::GroupMembers(doc, pg, selGroupId)) ops::ClearGroupId(doc, pg, o);
+        selGroupId = 0;
+        groupSel = { sel.obj };
+        CommitIfDirty("Ungroup");
+        Toasts("Split into separate lines");
+        return;
+    }
+    if (!sel.parent && ops::ObjectType(sel.obj) == FPDF_PAGEOBJ_FORM) {
+        ops::ExplodeForm(doc, pg, sel.obj);
+        sel.Clear(); groupSel.clear();
+        CommitIfDirty("Ungroup");
+        Toasts("Broke the group into separate pieces");
+    }
+}
+
 // Is there a form widget under this page point? Returns the annot or nullptr.
 static FPDF_ANNOTATION FormFieldAt(App& a, int page, float px, float py) {
     if (!a.doc.Form()) return nullptr;
@@ -173,31 +264,39 @@ void App::DrawCanvas() {
         pendingScrollPage = -1;
     }
 
-    // Wheel: zoom (Ctrl) or scroll.
+    float viewW = region.x;
+    float maxScroll = std::max(0.0f, totalH - region.y);
+    // How far the widest page overflows the viewport horizontally.
+    float maxScrollX = std::max(0.0f, maxContentW - (viewW - 40.0f));
+
+    // Wheel: zoom (Ctrl), horizontal scroll (Shift), else vertical scroll.
     if (hovered && io.MouseWheel != 0) {
         if (io.KeyCtrl) {
             float oldZoom = zoom;
             zoom = std::clamp(zoom * (io.MouseWheel > 0 ? 1.1f : 1.0f / 1.1f), 0.1f, 8.0f);
-            // keep the point under the cursor stable
+            // keep the point under the cursor stable (both axes)
             float cy = io.MousePos.y - origin.y + scrollY;
             scrollY += cy * (zoom / oldZoom - 1.0f);
+            float cx = io.MousePos.x - origin.x + scrollX;
+            scrollX += cx * (zoom / oldZoom - 1.0f);
             InvalidateAll();
+        } else if (io.KeyShift) {
+            scrollX -= io.MouseWheel * 80.0f;
         } else {
             scrollY -= io.MouseWheel * 80.0f;
         }
     }
-    float maxScroll = std::max(0.0f, totalH - region.y);
-    scrollY = std::clamp(scrollY, 0.0f, maxScroll);
+    if (hovered && io.MouseWheelH != 0) scrollX -= io.MouseWheelH * 80.0f;   // trackpad / tilt wheel
 
-    // Middle-drag or Hand tool: pan.
+    // Middle-drag or Hand tool: pan both axes.
     bool panning = (tool == Tool::Hand && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) ||
                    (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle));
     if (panning) {
-        ImVec2 dd = io.MouseDelta;
-        scrollY -= dd.y;
-        scrollX -= dd.x;
-        scrollY = std::clamp(scrollY, 0.0f, maxScroll);
+        scrollY -= io.MouseDelta.y;
+        scrollX -= io.MouseDelta.x;
     }
+    scrollY = std::clamp(scrollY, 0.0f, maxScroll);
+    scrollX = std::clamp(scrollX, 0.0f, maxScrollX);
 
     // --- lay out + draw each page ---
     float baseX = origin.x + std::max(20.0f, (region.x - maxContentW) / 2) - scrollX;
@@ -244,21 +343,43 @@ void App::DrawCanvas() {
 
     // --- selection overlay ---
     if (sel.Valid(doc) && sel.page >= 0 && cache[sel.page].laid) {
-        PRect b = sel.PageBounds();
+        bool grp = groupSel.size() > 1;
+        // thin outline around each member of a multi/group selection
+        if (grp) {
+            for (auto o : groupSel) {
+                PRect mb = ops::ObjectBounds(o);
+                ImVec2 m0 = PageToScreen(*this, sel.page, mb.l, mb.t);
+                ImVec2 m1 = PageToScreen(*this, sel.page, mb.r, mb.b);
+                dl->AddRect(ImVec2(std::min(m0.x, m1.x), std::min(m0.y, m1.y)),
+                            ImVec2(std::max(m0.x, m1.x), std::max(m0.y, m1.y)), IM_COL32(60, 150, 255, 120));
+            }
+        }
+        PRect b = SelectionBounds();
         sel.bounds = b;
         ImVec2 c0 = PageToScreen(*this, sel.page, b.l, b.t);
         ImVec2 c1 = PageToScreen(*this, sel.page, b.r, b.b);
         ImVec2 p0(std::min(c0.x, c1.x) - 1, std::min(c0.y, c1.y) - 1);
         ImVec2 p1(std::max(c0.x, c1.x) + 1, std::max(c0.y, c1.y) + 1);
-        dl->AddRect(p0, p1, IM_COL32(60, 150, 255, 255), 0, 0, 1.5f);
+        ImU32 boxCol = selGroupId ? IM_COL32(70, 200, 120, 255) : IM_COL32(60, 150, 255, 255);
+        dl->AddRect(p0, p1, boxCol, 0, 0, grp ? 2.0f : 1.5f);
         if (tool == Tool::Select) {
             ImVec2 h[8];
             HandlePoints(p0, p1, h);
             for (int i = 0; i < 8; ++i) {
                 dl->AddRectFilled(ImVec2(h[i].x - 4, h[i].y - 4), ImVec2(h[i].x + 4, h[i].y + 4), IM_COL32(255, 255, 255, 255));
-                dl->AddRect(ImVec2(h[i].x - 4, h[i].y - 4), ImVec2(h[i].x + 4, h[i].y + 4), IM_COL32(60, 150, 255, 255));
+                dl->AddRect(ImVec2(h[i].x - 4, h[i].y - 4), ImVec2(h[i].x + 4, h[i].y + 4), boxCol);
             }
         }
+    }
+
+    // --- marquee preview ---
+    if (dragging && dragMode == 5 && dragPage >= 0 && cache[dragPage].laid) {
+        ImVec2 a0 = PageToScreen(*this, dragPage, marquee.l, marquee.t);
+        ImVec2 a1 = PageToScreen(*this, dragPage, marquee.r, marquee.b);
+        ImVec2 p0(std::min(a0.x, a1.x), std::min(a0.y, a1.y));
+        ImVec2 p1(std::max(a0.x, a1.x), std::max(a0.y, a1.y));
+        dl->AddRectFilled(p0, p1, IM_COL32(60, 150, 255, 30));
+        dl->AddRect(p0, p1, IM_COL32(60, 150, 255, 200));
     }
 
     // --- drag preview (rect / redact) ---
@@ -286,6 +407,10 @@ void App::HandleCanvasInput(bool hovered) {
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 mouse = io.MousePos;
 
+    // Drop any stale multi-selection once the selection is no longer valid
+    // (e.g. after undo/redo or a structural page change invalidated handles).
+    if (!sel.Valid(doc) && !groupSel.empty()) { groupSel.clear(); selGroupId = 0; }
+
     // Forward queued characters / edit keys to a focused form field.
     if (formPage >= 0 && doc.Form()) {
         for (ImWchar ch : io.InputQueueCharacters)
@@ -301,32 +426,24 @@ void App::HandleCanvasInput(bool hovered) {
             if (ImGui::IsKeyPressed(e.k, false)) { ForwardFormKey(e.vk, true); ForwardFormKey(e.vk, false); }
     }
 
-    // Delete selected object.
-    if (!editing && sel.Valid(doc) && ImGui::IsKeyPressed(ImGuiKey_Delete) && formPage < 0) {
-        int pg = sel.page;
-        EnsureSelectionEditable();
-        if (ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent)) {
-            sel.Clear();
-            CommitIfDirty("Delete object");
-        }
-    }
+    // Delete selected object(s).
+    if (!editing && sel.Valid(doc) && ImGui::IsKeyPressed(ImGuiKey_Delete) && formPage < 0)
+        DeleteSelection();
 
     // ---- arrow-key nudge / resize of the selection ----
     if (!editing && sel.Valid(doc) && formPage < 0) {
         float step = io.KeyShift ? 10.0f : (io.KeyCtrl ? 0.25f : 1.0f);
         bool alt = io.KeyAlt;   // Alt = resize (grow/shrink from lower-left) instead of move
         auto nudge = [&](float dx, float dy) {
-            EnsureSelectionEditable();
             if (alt) {
-                PRect b = sel.PageBounds();
+                PRect b = SelectionBounds();
                 PRect t{ b.l, b.b, b.r + dx, b.t + dy };
                 if (t.r < t.l + 1) t.r = t.l + 1;
                 if (t.t < t.b + 1) t.t = t.b + 1;
-                ops::ResizeObjectPageTopLevel(doc, sel.page, sel.obj, t);
+                ResizeSelectionTo(t);
             } else {
-                ops::TranslateObjectPage(doc, sel.page, sel.obj, sel.accum, dx, dy);
+                MoveSelection(dx, dy);
             }
-            InvalidatePage(sel.page);
             nudgeDirty = true;
         };
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  nudge(-step, 0);
@@ -344,7 +461,7 @@ void App::HandleCanvasInput(bool hovered) {
     // ---- grab a resize handle of the current selection ----
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && tool == Tool::Select && !dragging &&
         sel.Valid(doc) && sel.page >= 0 && sel.page < (int)cache.size() && cache[sel.page].laid) {
-        PRect b = sel.PageBounds();
+        PRect b = SelectionBounds();
         ImVec2 c0 = PageToScreen(*this, sel.page, b.l, b.t);
         ImVec2 c1 = PageToScreen(*this, sel.page, b.r, b.b);
         ImVec2 p0(std::min(c0.x, c1.x) - 1, std::min(c0.y, c1.y) - 1);
@@ -353,9 +470,19 @@ void App::HandleCanvasInput(bool hovered) {
         HandlePoints(p0, p1, h);
         int hi = HandleAt(h, mouse, 6.0f);
         if (hi >= 0) {
-            EnsureSelectionEditable();
+            if (groupSel.size() <= 1) EnsureSelectionEditable();
             dragging = true; dragMode = 4; dragPage = sel.page; resizeHandle = hi;
-            resizeStart = sel.PageBounds();
+            resizeStart = SelectionBounds();
+        }
+    }
+
+    // ---- right-click: select what's under the cursor, open the object menu ----
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && over && formPage < 0) {
+        auto hit = ops::HitTest(doc, page, px, py, 4.0f / std::max(0.05f, zoom));
+        if (hit) {
+            sel.Set(doc, page, *hit);
+            if (!io.KeyAlt) RefreshGroupSel(); else { groupSel = { sel.obj }; selGroupId = 0; }
+            openObjCtx = true;
         }
     }
 
@@ -375,13 +502,29 @@ void App::HandleCanvasInput(bool hovered) {
         } else {
             if (formPage >= 0) { doc.KillFormFocus(); InvalidatePage(formPage); formPage = -1; }
             switch (tool) {
-            case Tool::Select:
-                SelectObjectAt(page, px, py);
+            case Tool::Select: {
+                // If clicking inside the current multi/group selection, keep it and drag the whole set.
+                bool insideGroup = groupSel.size() > 1 && sel.Valid(doc) && sel.page == page &&
+                                   SelectionBounds().Contains(px, py);
+                if (!insideGroup) {
+                    SelectObjectAt(page, px, py);
+                    if (sel.Valid(doc)) {
+                        if (!io.KeyAlt) RefreshGroupSel();
+                        else { groupSel = { sel.obj }; selGroupId = 0; }
+                    }
+                }
                 if (sel.Valid(doc)) {
                     dragging = true; dragMode = 1; dragPage = page;
                     dragLastPx = px; dragLastPy = py;
+                } else {
+                    // empty space: start a marquee rubber-band selection
+                    dragging = true; dragMode = 5; dragPage = page;
+                    dragStartPx = px; dragStartPy = py;
+                    marquee = { px, py, px, py };
+                    groupSel.clear(); selGroupId = 0;
                 }
                 break;
+            }
             case Tool::Text:
                 editing = true; editIsNew = true; editPage = page;
                 editAtX = px; editAtY = py; editBuf.clear();
@@ -422,10 +565,8 @@ void App::HandleCanvasInput(bool hovered) {
             if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage) {
                 float ddx = nx - dragLastPx, ddy = ny - dragLastPy;
                 if (ddx != 0 || ddy != 0) {
-                    if (sel.parent) EnsureSelectionEditable();   // flatten the group on first real move
-                    ops::TranslateObjectPage(doc, dragPage, sel.obj, sel.accum, ddx, ddy);
+                    MoveSelection(ddx, ddy);
                     dragLastPx = nx; dragLastPy = ny;
-                    InvalidatePage(dragPage);
                 }
             }
         } else if (dragMode == 4 && sel.Valid(doc)) {
@@ -441,9 +582,12 @@ void App::HandleCanvasInput(bool hovered) {
                 if (R) t.r = std::max(nx, resizeStart.l + MIN);
                 if (T) t.t = std::max(ny, resizeStart.b + MIN);
                 if (B) t.b = std::min(ny, resizeStart.t - MIN);
-                ops::ResizeObjectPageTopLevel(doc, dragPage, sel.obj, t);
-                InvalidatePage(dragPage);
+                ResizeSelectionTo(t);
             }
+        } else if (dragMode == 5) {
+            int p2; float nx, ny;
+            if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage)
+                marquee = PRect::FromPoints(dragStartPx, dragStartPy, nx, ny);
         } else if (dragMode == 2 || dragMode == 3) {
             int p2; float nx, ny;
             if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage)
@@ -454,10 +598,25 @@ void App::HandleCanvasInput(bool hovered) {
     // ---- mouse up ----
     if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         if (dragMode == 1) {
-            if (sel.Valid(doc)) CommitIfDirty("Move object");
+            if (sel.Valid(doc)) CommitIfDirty(groupSel.size() > 1 ? "Move group" : "Move object");
         } else if (dragMode == 4) {
-            if (sel.Valid(doc)) CommitIfDirty("Resize object");
+            if (sel.Valid(doc)) CommitIfDirty("Resize");
             resizeHandle = -1;
+        } else if (dragMode == 5) {
+            // finalize marquee: select every top-level object intersecting the box
+            if (marquee.Area() > 1) {
+                groupSel.clear(); selGroupId = 0; sel.Clear();
+                for (auto& o : ops::ListObjects(doc, dragPage)) {
+                    if (o.parent) continue;              // top-level only
+                    if (o.bounds.Intersects(marquee)) groupSel.push_back(o.obj);
+                }
+                if (!groupSel.empty()) {
+                    ops::ObjInfo first;
+                    first.obj = groupSel[0]; first.parent = nullptr; first.bounds = ops::ObjectBounds(groupSel[0]);
+                    sel.Set(doc, dragPage, first);
+                    Toasts(Fmt("%d objects selected - right-click to group", (int)groupSel.size()));
+                }
+            }
         } else if (dragMode == 2 && dragRect.Area() > 4) {
             FPDF_PAGEOBJECT o = ops::AddRect(doc, dragPage, dragRect, rectFilled,
                                              (unsigned)(fillColor[0] * 255), (unsigned)(fillColor[1] * 255), (unsigned)(fillColor[2] * 255),
@@ -483,5 +642,47 @@ void App::HandleCanvasInput(bool hovered) {
             editing = true; editIsNew = false; editPage = page; editObj = sel.obj;
             editBuf = W2U(tp.text);
         }
+    }
+
+    // ---- Escape clears the selection; Ctrl+A selects everything on the page ----
+    if (!editing && formPage < 0) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { sel.Clear(); groupSel.clear(); selGroupId = 0; }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) && doc.PageCount() > 0) {
+            int pg = currentPage;
+            groupSel.clear(); selGroupId = 0; sel.Clear();
+            int common = -1; bool sameGroup = true;
+            for (auto& o : ops::ListObjects(doc, pg)) {
+                if (o.parent) continue;
+                groupSel.push_back(o.obj);
+                int gid = ops::GetGroupId(o.obj);
+                if (common == -1) common = gid; else if (common != gid) sameGroup = false;
+            }
+            if (!groupSel.empty()) {
+                ops::ObjInfo first;
+                first.obj = groupSel[0]; first.parent = nullptr; first.bounds = ops::ObjectBounds(groupSel[0]);
+                sel.Set(doc, pg, first);
+                selGroupId = (sameGroup && common > 0) ? common : 0;
+                Toasts(Fmt("Selected %d objects on this page", (int)groupSel.size()));
+            }
+        }
+    }
+
+    // ---- object context menu (right-click) ----
+    if (openObjCtx) { ImGui::OpenPopup("##objctx"); openObjCtx = false; }
+    if (ImGui::BeginPopup("##objctx")) {
+        bool grouped = selGroupId != 0;
+        bool multi = groupSel.size() > 1;
+        bool isForm = sel.Valid(doc) && !sel.parent && ops::ObjectType(sel.obj) == FPDF_PAGEOBJ_FORM;
+        if (multi && !grouped)
+            if (ImGui::MenuItem(Fmt("Group these %d into one", (int)groupSel.size()).c_str())) GroupSelection();
+        if (grouped) {
+            ImGui::TextDisabled("Grouped - moves as one piece");
+            if (ImGui::MenuItem("Ungroup (back to separate lines)")) UngroupSelection();
+        }
+        if (isForm)
+            if (ImGui::MenuItem("Break apart (ungroup)")) UngroupSelection();
+        if (multi || grouped || isForm) ImGui::Separator();
+        if (ImGui::MenuItem("Delete")) DeleteSelection();
+        ImGui::EndPopup();
     }
 }

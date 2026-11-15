@@ -112,6 +112,31 @@ int RunSelfTest() {
         Check(grew, "resize persisted through save + reload");
     }
 
+    // ---- grouping tags persist through save/reload ----
+    Out("\nGrouping (tag survives save/reload):\n");
+    {
+        Document g;
+        g.CreateBlank(612, 792);
+        ops::AddTable(g, 0, { 54, 54, 558, 738 }, 3, 1, false, 0, 0, 0, 0, 1.0f);
+        int gid = 7, tagged = 0;
+        for (auto& o : ops::ListObjects(g, 0))
+            if (o.type == FPDF_PAGEOBJ_PATH) { ops::SetGroupId(g, 0, o.obj, gid); ++tagged; }
+        Check(tagged > 0, "tagged the table lines with a group id");
+        Check((int)ops::GroupMembers(g, 0, gid).size() == tagged, "GroupMembers returns every tagged line");
+        Check(ops::MaxGroupId(g) == gid, "MaxGroupId finds the id");
+        g.Commit("group");
+        Bytes gb; g.SaveBytes(gb, 0);
+        Document gr; std::string ge;
+        Check(gr.LoadBytes(std::make_shared<Bytes>(gb), "", ge) == Document::Load::Ok, "reload grouped doc");
+        int found = 0;
+        for (auto& o : ops::ListObjects(gr, 0)) if (ops::GetGroupId(o.obj) == gid) ++found;
+        Check(found == tagged, "group tag survived save + reload");
+        for (auto o : ops::GroupMembers(gr, 0, gid)) ops::ClearGroupId(gr, 0, o);
+        int still = 0;
+        for (auto& o : ops::ListObjects(gr, 0)) if (ops::GetGroupId(o.obj) != 0) ++still;
+        Check(still == 0, "ungroup cleared every tag");
+    }
+
     // ---- nested objects inside a Form XObject (the "lines are pictures" case) ----
     Out("\nNested Form XObject editing:\n");
     {

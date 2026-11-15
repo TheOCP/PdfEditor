@@ -85,6 +85,9 @@ bool DeleteObjectNested(Document& d, int page, FPDF_PAGEOBJECT obj, FPDF_PAGEOBJ
 // Returns true if target is top-level afterwards (or already was).
 bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target);
 
+// Breaks a top-level Form XObject into its child objects on the page.
+bool ExplodeForm(Document& d, int page, FPDF_PAGEOBJECT form);
+
 // ---- images ----------------------------------------------------------------
 
 // Places `img` with its lower-left at (px,py), drawn `widthPt` wide (height
@@ -117,6 +120,19 @@ void ResizeObjectPageTopLevel(Document& d, int page, FPDF_PAGEOBJECT obj, PRect 
 struct StrokeProps { bool isPath = false; float width = 1; unsigned r = 0, g = 0, b = 0, a = 255; };
 StrokeProps ReadStroke(FPDF_PAGEOBJECT obj);
 void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width);
+
+// Applies an arbitrary affine to a top-level object (used for group move/resize).
+void TransformObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& m);
+
+// ---- grouping ------------------------------------------------------------
+// Objects are grouped by a persistent content-mark tag ("PEGroup"/id) that
+// survives save + reload, so a set of lines can act as one object and be split
+// again. Grouping needs top-level objects (promote nested ones first).
+int  GetGroupId(FPDF_PAGEOBJECT obj);                 // 0 = ungrouped
+void SetGroupId(Document& d, int page, FPDF_PAGEOBJECT obj, int id);
+void ClearGroupId(Document& d, int page, FPDF_PAGEOBJECT obj);
+int  MaxGroupId(Document& d);                         // highest id in use (0 if none)
+std::vector<FPDF_PAGEOBJECT> GroupMembers(Document& d, int page, int id);
 
 // Removes every top-level object fully inside `box`, then paints `box` solid.
 // This actually deletes the covered content (unlike a black highlight on top).

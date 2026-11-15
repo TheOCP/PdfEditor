@@ -258,7 +258,29 @@ void App::DrawProperties() {
     if (ImGui::CollapsingHeader("Selection", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (!sel.Valid(doc)) {
             ImGui::TextDisabled("Nothing selected.");
-            ImGui::TextWrapped("Use the Select tool and click an object. Double-click text to edit it.");
+            ImGui::TextWrapped("Click an object, or drag a box over several. Double-click text to edit. "
+                               "Right-click to group / ungroup.");
+        } else if (groupSel.size() > 1) {
+            // multi / group selection
+            if (selGroupId) ImGui::Text("Group of %d objects (moves as one)", (int)groupSel.size());
+            else ImGui::Text("%d objects selected", (int)groupSel.size());
+            PRect b = SelectionBounds();
+            float left = b.l, bottom = b.b;
+            ImGui::SetNextItemWidth(90); ImGui::DragFloat("X", &left, 0.5f, -10000, 10000, "%.1f");
+            bool xe = ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::DragFloat("Y", &bottom, 0.5f, -10000, 10000, "%.1f");
+            bool ye = ImGui::IsItemDeactivatedAfterEdit();
+            if (xe || ye) { MoveSelection(left - b.l, bottom - b.b); CommitIfDirty("Move group"); }
+            ImGui::Text("Size: %.1f x %.1f pt", b.W(), b.H());
+            ImGui::TextDisabled("Arrows move - Alt+arrows / handles resize all together");
+            ImGui::Separator();
+            if (selGroupId) {
+                if (ImGui::Button("Ungroup (separate lines)")) UngroupSelection();
+            } else {
+                if (ImGui::Button("Group into one")) GroupSelection();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Delete all")) DeleteSelection();
         } else {
             int t = ops::ObjectType(sel.obj);
             const char* tn = t == FPDF_PAGEOBJ_TEXT ? "Text" : t == FPDF_PAGEOBJ_IMAGE ? "Image" :
