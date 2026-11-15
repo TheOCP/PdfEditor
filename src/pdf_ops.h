@@ -97,6 +97,27 @@ FPDF_PAGEOBJECT AddImage(Document& d, int page, const Image& img, float px, floa
 FPDF_PAGEOBJECT AddRect(Document& d, int page, PRect box, bool fill, unsigned fr, unsigned fg, unsigned fb,
                         bool stroke, unsigned sr, unsigned sg, unsigned sb, float strokeW);
 
+// A single straight line segment as its own editable stroked path object.
+FPDF_PAGEOBJECT AddLine(Document& d, int page, float x1, float y1, float x2, float y2,
+                        unsigned r, unsigned g, unsigned b, float width);
+
+// Builds a table/grid as individual line objects inside `box`, so every line can
+// be selected, moved, resized or deleted on its own. `cols`/`rows` are the body
+// divisions; `header` adds a separator line `headerH` points below the top edge.
+// Returns the number of line objects created.
+int AddTable(Document& d, int page, PRect box, int cols, int rows, bool header, float headerH,
+             unsigned r, unsigned g, unsigned b, float width);
+
+// Maps the object's current page bounds onto `target` (scale + reposition).
+// Top-level objects only — promote first. Degenerate axes (e.g. a line's
+// thickness) are left unscaled so lines keep their width.
+void ResizeObjectPageTopLevel(Document& d, int page, FPDF_PAGEOBJECT obj, PRect target);
+
+// Stroke of a path object (line colour + width).
+struct StrokeProps { bool isPath = false; float width = 1; unsigned r = 0, g = 0, b = 0, a = 255; };
+StrokeProps ReadStroke(FPDF_PAGEOBJECT obj);
+void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width);
+
 // Removes every top-level object fully inside `box`, then paints `box` solid.
 // This actually deletes the covered content (unlike a black highlight on top).
 int Redact(Document& d, int page, PRect box, unsigned r, unsigned g, unsigned b);

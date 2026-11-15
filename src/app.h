@@ -116,12 +116,25 @@ public:
 
     // drag interaction
     bool dragging = false;
-    int dragMode = 0;            // 0 none, 1 move obj, 2 rect, 3 redact
+    int dragMode = 0;            // 0 none, 1 move obj, 2 rect, 3 redact, 4 resize
     int dragPage = -1;
     ImVec2 dragStartScreen{ 0, 0 };
     float dragStartPx = 0, dragStartPy = 0;
     float dragLastPx = 0, dragLastPy = 0;
     PRect dragRect;
+    int resizeHandle = -1;       // 0..7 = TL,T,TR,R,BR,B,BL,L
+    PRect resizeStart;           // selection page bounds at grab
+    bool nudgeDirty = false;     // arrow-key edits pending a commit
+
+    // table / form generator
+    bool showTable = false;
+    int tableCols = 4;
+    int tableRows = 1;
+    bool tableHeader = true;
+    float tableHeaderH = 24.0f;
+    float tableMargin = 54.0f;
+    float tableLineW = 1.0f;
+    float tableColor[3] = { 0, 0, 0 };
 
     // search
     std::string searchQuery;

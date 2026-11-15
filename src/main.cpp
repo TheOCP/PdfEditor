@@ -65,7 +65,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // Keyboard nav stays off so arrow keys are free to nudge the selected object.
     io.IniFilename = nullptr;    // don't scatter imgui.ini next to the exe
     ApplyDarkTheme();
 

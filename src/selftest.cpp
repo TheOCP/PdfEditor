@@ -83,6 +83,35 @@ int RunSelfTest() {
         Check(arial, "font matcher returns a candidate for 'Helvetica'");
     }
 
+    // ---- table generator + resize ----
+    Out("\nTable / form + resize:\n");
+    {
+        Document t;
+        t.CreateBlank(612, 792);
+        int lines = ops::AddTable(t, 0, { 54, 54, 558, 738 }, 4, 1, true, 24, 0, 0, 0, 1.0f);
+        // 4 cols -> 5 verticals, 1 row -> 2 horizontals, + 1 header = 8
+        Check(lines == 8, "table built the expected number of lines");
+        auto objs = ops::ListObjects(t, 0);
+        int paths = 0; for (auto& o : objs) if (o.type == FPDF_PAGEOBJ_PATH) ++paths;
+        Check(paths == 8, "every table line is its own editable object");
+        t.Commit("table");
+
+        // resize one line and confirm its bounds change + persist
+        FPDF_PAGEOBJECT line = nullptr; PRect lb0;
+        for (auto& o : objs) if (o.type == FPDF_PAGEOBJ_PATH) { line = o.obj; lb0 = o.bounds; break; }
+        Check(line != nullptr, "got a table line to resize");
+        PRect target{ lb0.l, lb0.b, lb0.l + 200, lb0.b + 50 };
+        ops::ResizeObjectPageTopLevel(t, 0, line, target);
+        t.Bake();
+        Bytes tb; t.SaveBytes(tb, 0);
+        Document tr; std::string te;
+        Check(tr.LoadBytes(std::make_shared<Bytes>(tb), "", te) == Document::Load::Ok, "reload after resize");
+        bool grew = false;
+        for (auto& o : ops::ListObjects(tr, 0))
+            if (o.type == FPDF_PAGEOBJ_PATH && o.bounds.W() > 150) grew = true;
+        Check(grew, "resize persisted through save + reload");
+    }
+
     // ---- nested objects inside a Form XObject (the "lines are pictures" case) ----
     Out("\nNested Form XObject editing:\n");
     {

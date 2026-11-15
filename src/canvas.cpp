@@ -11,6 +11,20 @@ const float kPad = 16.0f;    // top/bottom padding
 const int   kMaxTexDim = 4096;
 
 ImU32 Col(const float c[4]) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3])); }
+
+// 8 resize handles for a screen rect: 0 TL,1 T,2 TR,3 R,4 BR,5 B,6 BL,7 L.
+void HandlePoints(ImVec2 p0, ImVec2 p1, ImVec2 out[8]) {
+    float mx = (p0.x + p1.x) * 0.5f, my = (p0.y + p1.y) * 0.5f;
+    out[0] = { p0.x, p0.y }; out[1] = { mx, p0.y }; out[2] = { p1.x, p0.y };
+    out[3] = { p1.x, my };   out[4] = { p1.x, p1.y }; out[5] = { mx, p1.y };
+    out[6] = { p0.x, p1.y }; out[7] = { p0.x, my };
+}
+// Which handle is within `tol` px of `m`, or -1.
+int HandleAt(const ImVec2 h[8], ImVec2 m, float tol) {
+    for (int i = 0; i < 8; ++i)
+        if (std::fabs(h[i].x - m.x) <= tol && std::fabs(h[i].y - m.y) <= tol) return i;
+    return -1;
+}
 } // namespace
 
 // Page-space point -> screen pixel, using the page's laid-out rect.
@@ -237,7 +251,14 @@ void App::DrawCanvas() {
         ImVec2 p0(std::min(c0.x, c1.x) - 1, std::min(c0.y, c1.y) - 1);
         ImVec2 p1(std::max(c0.x, c1.x) + 1, std::max(c0.y, c1.y) + 1);
         dl->AddRect(p0, p1, IM_COL32(60, 150, 255, 255), 0, 0, 1.5f);
-        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + 0), IM_COL32(60, 150, 255, 40));
+        if (tool == Tool::Select) {
+            ImVec2 h[8];
+            HandlePoints(p0, p1, h);
+            for (int i = 0; i < 8; ++i) {
+                dl->AddRectFilled(ImVec2(h[i].x - 4, h[i].y - 4), ImVec2(h[i].x + 4, h[i].y + 4), IM_COL32(255, 255, 255, 255));
+                dl->AddRect(ImVec2(h[i].x - 4, h[i].y - 4), ImVec2(h[i].x + 4, h[i].y + 4), IM_COL32(60, 150, 255, 255));
+            }
+        }
     }
 
     // --- drag preview (rect / redact) ---
@@ -290,11 +311,56 @@ void App::HandleCanvasInput(bool hovered) {
         }
     }
 
+    // ---- arrow-key nudge / resize of the selection ----
+    if (!editing && sel.Valid(doc) && formPage < 0) {
+        float step = io.KeyShift ? 10.0f : (io.KeyCtrl ? 0.25f : 1.0f);
+        bool alt = io.KeyAlt;   // Alt = resize (grow/shrink from lower-left) instead of move
+        auto nudge = [&](float dx, float dy) {
+            EnsureSelectionEditable();
+            if (alt) {
+                PRect b = sel.PageBounds();
+                PRect t{ b.l, b.b, b.r + dx, b.t + dy };
+                if (t.r < t.l + 1) t.r = t.l + 1;
+                if (t.t < t.b + 1) t.t = t.b + 1;
+                ops::ResizeObjectPageTopLevel(doc, sel.page, sel.obj, t);
+            } else {
+                ops::TranslateObjectPage(doc, sel.page, sel.obj, sel.accum, dx, dy);
+            }
+            InvalidatePage(sel.page);
+            nudgeDirty = true;
+        };
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  nudge(-step, 0);
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) nudge(+step, 0);
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    nudge(0, +step);
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  nudge(0, -step);
+        bool anyDown = ImGui::IsKeyDown(ImGuiKey_LeftArrow) || ImGui::IsKeyDown(ImGuiKey_RightArrow) ||
+                       ImGui::IsKeyDown(ImGuiKey_UpArrow) || ImGui::IsKeyDown(ImGuiKey_DownArrow);
+        if (nudgeDirty && !anyDown) { CommitIfDirty("Nudge"); nudgeDirty = false; }
+    }
+
     int page; float px, py;
     bool over = hovered && ScreenToPage(mouse, page, px, py);
 
+    // ---- grab a resize handle of the current selection ----
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && tool == Tool::Select && !dragging &&
+        sel.Valid(doc) && sel.page >= 0 && sel.page < (int)cache.size() && cache[sel.page].laid) {
+        PRect b = sel.PageBounds();
+        ImVec2 c0 = PageToScreen(*this, sel.page, b.l, b.t);
+        ImVec2 c1 = PageToScreen(*this, sel.page, b.r, b.b);
+        ImVec2 p0(std::min(c0.x, c1.x) - 1, std::min(c0.y, c1.y) - 1);
+        ImVec2 p1(std::max(c0.x, c1.x) + 1, std::max(c0.y, c1.y) + 1);
+        ImVec2 h[8];
+        HandlePoints(p0, p1, h);
+        int hi = HandleAt(h, mouse, 6.0f);
+        if (hi >= 0) {
+            EnsureSelectionEditable();
+            dragging = true; dragMode = 4; dragPage = sel.page; resizeHandle = hi;
+            resizeStart = sel.PageBounds();
+        }
+    }
+
     // ---- mouse down ----
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && over) {
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && over && !dragging) {
         // Always give the form engine first refusal (click to focus/toggle).
         FPDF_ANNOTATION widget = FormFieldAt(*this, page, px, py);
         if (widget) FPDFPage_CloseAnnot(widget);
@@ -362,6 +428,22 @@ void App::HandleCanvasInput(bool hovered) {
                     InvalidatePage(dragPage);
                 }
             }
+        } else if (dragMode == 4 && sel.Valid(doc)) {
+            int p2; float nx, ny;
+            if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage) {
+                const float MIN = 1.0f;
+                PRect t = resizeStart;
+                bool L = (resizeHandle == 0 || resizeHandle == 6 || resizeHandle == 7);
+                bool R = (resizeHandle == 2 || resizeHandle == 3 || resizeHandle == 4);
+                bool T = (resizeHandle == 0 || resizeHandle == 1 || resizeHandle == 2);
+                bool B = (resizeHandle == 4 || resizeHandle == 5 || resizeHandle == 6);
+                if (L) t.l = std::min(nx, resizeStart.r - MIN);
+                if (R) t.r = std::max(nx, resizeStart.l + MIN);
+                if (T) t.t = std::max(ny, resizeStart.b + MIN);
+                if (B) t.b = std::min(ny, resizeStart.t - MIN);
+                ops::ResizeObjectPageTopLevel(doc, dragPage, sel.obj, t);
+                InvalidatePage(dragPage);
+            }
         } else if (dragMode == 2 || dragMode == 3) {
             int p2; float nx, ny;
             if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage)
@@ -373,6 +455,9 @@ void App::HandleCanvasInput(bool hovered) {
     if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         if (dragMode == 1) {
             if (sel.Valid(doc)) CommitIfDirty("Move object");
+        } else if (dragMode == 4) {
+            if (sel.Valid(doc)) CommitIfDirty("Resize object");
+            resizeHandle = -1;
         } else if (dragMode == 2 && dragRect.Area() > 4) {
             FPDF_PAGEOBJECT o = ops::AddRect(doc, dragPage, dragRect, rectFilled,
                                              (unsigned)(fillColor[0] * 255), (unsigned)(fillColor[1] * 255), (unsigned)(fillColor[2] * 255),

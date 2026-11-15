@@ -339,6 +339,76 @@ FPDF_PAGEOBJECT AddRect(Document& d, int page, PRect box, bool fill, unsigned fr
     return r;
 }
 
+FPDF_PAGEOBJECT AddLine(Document& d, int page, float x1, float y1, float x2, float y2,
+                        unsigned r, unsigned g, unsigned b, float width) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p) return nullptr;
+    FPDF_PAGEOBJECT ln = FPDFPageObj_CreateNewPath(x1, y1);
+    if (!ln) return nullptr;
+    FPDFPath_LineTo(ln, x2, y2);
+    FPDFPageObj_SetStrokeColor(ln, r, g, b, 255);
+    FPDFPageObj_SetStrokeWidth(ln, width <= 0 ? 1.0f : width);
+    FPDFPath_SetDrawMode(ln, FPDF_FILLMODE_NONE, 1);
+    FPDFPage_InsertObject(p, ln);
+    d.ContentChanged(page);
+    return ln;
+}
+
+int AddTable(Document& d, int page, PRect box, int cols, int rows, bool header, float headerH,
+             unsigned r, unsigned g, unsigned b, float width) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p || box.W() <= 1 || box.H() <= 1) return 0;
+    cols = std::max(1, std::min(cols, 100));
+    rows = std::max(1, std::min(rows, 200));
+    int count = 0;
+    // vertical column dividers (incl. left & right borders)
+    for (int i = 0; i <= cols; ++i) {
+        float x = box.l + box.W() * i / cols;
+        if (AddLine(d, page, x, box.b, x, box.t, r, g, b, width)) ++count;
+    }
+    // horizontal row dividers (incl. top & bottom borders)
+    for (int j = 0; j <= rows; ++j) {
+        float y = box.b + box.H() * j / rows;
+        if (AddLine(d, page, box.l, y, box.r, y, r, g, b, width)) ++count;
+    }
+    // header separator near the top
+    if (header && headerH > 0 && headerH < box.H()) {
+        float y = box.t - headerH;
+        if (AddLine(d, page, box.l, y, box.r, y, r, g, b, width)) ++count;
+    }
+    FPDFPage_GenerateContent(p);
+    d.ContentChanged(page);
+    return count;
+}
+
+void ResizeObjectPageTopLevel(Document& d, int page, FPDF_PAGEOBJECT obj, PRect target) {
+    if (!obj) return;
+    PRect c = ObjectBounds(obj);     // top-level => page space
+    float sx = (c.W() > 0.5f && target.W() > 0) ? target.W() / c.W() : 1.0f;
+    float sy = (c.H() > 0.5f && target.H() > 0) ? target.H() / c.H() : 1.0f;
+    float e = target.l - c.l * sx;
+    float f = target.b - c.b * sy;
+    FPDFPageObj_Transform(obj, sx, 0, 0, sy, e, f);
+    d.ContentChanged(page);
+}
+
+StrokeProps ReadStroke(FPDF_PAGEOBJECT obj) {
+    StrokeProps s;
+    if (!obj) return s;
+    s.isPath = FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_PATH;
+    FPDFPageObj_GetStrokeWidth(obj, &s.width);
+    unsigned r = 0, g = 0, b = 0, a = 255;
+    if (FPDFPageObj_GetStrokeColor(obj, &r, &g, &b, &a)) { s.r = r; s.g = g; s.b = b; s.a = a; }
+    return s;
+}
+
+void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width) {
+    if (!obj) return;
+    FPDFPageObj_SetStrokeColor(obj, r, g, b, 255);
+    if (width > 0) FPDFPageObj_SetStrokeWidth(obj, width);
+    d.ContentChanged(page);
+}
+
 int Redact(Document& d, int page, PRect box, unsigned r, unsigned g, unsigned b) {
     FPDF_PAGE p = d.Page(page);
     if (!p) return 0;

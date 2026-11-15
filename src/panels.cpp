@@ -57,6 +57,15 @@ void App::DrawMenuBar() {
             if (ops::RotatePage(doc, currentPage, -1)) { CommitIfDirty("Rotate page"); }
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Insert")) {
+        bool has = doc.Raw() != nullptr;
+        if (ImGui::MenuItem("Table / form...", nullptr, false, has)) showTable = true;
+        ImGui::Separator();
+        if (ImGui::MenuItem("Text (click to place)", nullptr, tool == Tool::Text, has)) tool = Tool::Text;
+        if (ImGui::MenuItem("Image (click to place)", nullptr, tool == Tool::Image, has)) tool = Tool::Image;
+        if (ImGui::MenuItem("Rectangle (drag)", nullptr, tool == Tool::Rect, has)) tool = Tool::Rect;
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("Document")) {
         if (ImGui::MenuItem("Flatten forms && annotations", nullptr, false, doc.Raw() != nullptr)) DoFlatten();
         if (ImGui::MenuItem("Properties / metadata", nullptr, false, doc.Raw() != nullptr)) showMeta = true;
@@ -267,6 +276,7 @@ void App::DrawProperties() {
                 InvalidatePage(sel.page); CommitIfDirty("Move object");
             }
             ImGui::Text("Size: %.1f x %.1f pt", w, h);
+            ImGui::TextDisabled("Arrows: move  -  Shift: x10  -  Alt+arrows: resize  -  drag handles to resize");
 
             if (t == FPDF_PAGEOBJ_TEXT) {
                 ops::TextProps tp = ops::ReadText(doc, sel.page, sel.obj);
@@ -296,6 +306,28 @@ void App::DrawProperties() {
                         Toasts("Font applied");
                     } else Toasts("Restyle failed: " + err, true);
                 }
+            }
+
+            if (t == FPDF_PAGEOBJ_PATH) {
+                ops::StrokeProps st = ops::ReadStroke(sel.obj);
+                ImGui::Separator();
+                ImGui::TextDisabled("Line / stroke");
+                float lw = st.width;
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::DragFloat("Thickness", &lw, 0.05f, 0.1f, 40.0f, "%.2f pt")) {
+                    EnsureSelectionEditable();
+                    ops::SetObjectStroke(doc, sel.page, sel.obj, st.r, st.g, st.b, lw);
+                    InvalidatePage(sel.page);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line thickness");
+                float lc[3] = { st.r / 255.0f, st.g / 255.0f, st.b / 255.0f };
+                if (ImGui::ColorEdit3("Line colour", lc, ImGuiColorEditFlags_NoInputs)) {
+                    EnsureSelectionEditable();
+                    ops::SetObjectStroke(doc, sel.page, sel.obj, (unsigned)(lc[0] * 255), (unsigned)(lc[1] * 255),
+                                         (unsigned)(lc[2] * 255), st.width);
+                    InvalidatePage(sel.page);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line colour");
             }
             ImGui::Separator();
             if (ImGui::Button("Delete")) {
@@ -461,6 +493,48 @@ void App::DrawModals() {
         ImGui::SameLine();
         if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
         ImGui::InputTextMultiline("##extext", &extractedText, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+        ImGui::EndPopup();
+    }
+
+    // table / form
+    if (showTable) { ImGui::OpenPopup("Insert table / form##tbl"); showTable = false; }
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Insert table / form##tbl", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Builds a grid on the current page. Every line is a separate "
+                           "object you can then move, resize or delete individually.");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(120); ImGui::InputInt("Columns", &tableCols);
+        ImGui::SetNextItemWidth(120); ImGui::InputInt("Rows (body)", &tableRows);
+        tableCols = std::max(1, std::min(tableCols, 100));
+        tableRows = std::max(1, std::min(tableRows, 200));
+        ImGui::Checkbox("Header row", &tableHeader);
+        if (tableHeader) {
+            ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("Header height", &tableHeaderH, 0.5f, 6, 200, "%.0f pt");
+        }
+        ImGui::SetNextItemWidth(120); ImGui::DragFloat("Margin", &tableMargin, 0.5f, 0, 300, "%.0f pt");
+        ImGui::SetNextItemWidth(120); ImGui::DragFloat("Line width", &tableLineW, 0.05f, 0.2f, 10, "%.2f");
+        ImGui::ColorEdit3("Line colour", tableColor, ImGuiColorEditFlags_NoInputs);
+        if (ImGui::SmallButton("Match screenshot (4 cols, header)")) {
+            tableCols = 4; tableRows = 1; tableHeader = true; tableHeaderH = 24; tableColor[0] = tableColor[1] = tableColor[2] = 0;
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Create", ImVec2(110, 0))) {
+            FS_SIZEF sz = doc.PageSizePt(currentPage);
+            PRect box{ tableMargin, tableMargin, sz.width - tableMargin, sz.height - tableMargin };
+            int n = ops::AddTable(doc, currentPage, box, tableCols, tableRows, tableHeader, tableHeaderH,
+                                  (unsigned)(tableColor[0] * 255), (unsigned)(tableColor[1] * 255), (unsigned)(tableColor[2] * 255),
+                                  tableLineW);
+            if (n > 0) {
+                sel.Clear();
+                CommitIfDirty("Insert table");
+                Toasts(Fmt("Table added (%d editable lines) - switch to Select to move them", n));
+                tool = Tool::Select;
+                ImGui::CloseCurrentPopup();
+            } else Toasts("Could not build the table (check the margin vs page size)", true);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
