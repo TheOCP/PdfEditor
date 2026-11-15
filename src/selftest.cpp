@@ -6,6 +6,7 @@
 #include "sysfonts.h"
 #include <windows.h>
 #include <cstdio>
+#include <cmath>
 
 static int g_fail = 0;
 static FILE* g_log = nullptr;
@@ -80,6 +81,74 @@ int RunSelfTest() {
         Out("\nInstalled TTF fonts found: %zu\n", SystemFonts().size());
         bool arial = MatchSystemFont("Helvetica", nullptr) != nullptr;
         Check(arial, "font matcher returns a candidate for 'Helvetica'");
+    }
+
+    // ---- nested objects inside a Form XObject (the "lines are pictures" case) ----
+    Out("\nNested Form XObject editing:\n");
+    {
+        Document src;
+        src.CreateBlank(300, 300);
+        ops::AddRect(src, 0, { 20, 20, 280, 24 }, true, 0, 0, 0, false, 0, 0, 0, 1);   // thin 'lines'
+        ops::AddRect(src, 0, { 20, 60, 280, 64 }, true, 0, 0, 0, false, 0, 0, 0, 1);
+        ops::AddRect(src, 0, { 20, 100, 280, 104 }, true, 0, 0, 0, false, 0, 0, 0, 1);
+        src.Bake();
+
+        Document dst;
+        dst.CreateBlank(612, 792);
+        FPDF_XOBJECT xo = FPDF_NewXObjectFromPage(dst.Raw(), src.Raw(), 0);
+        Check(xo != nullptr, "create XObject from a page");
+        FPDF_PAGEOBJECT form = xo ? FPDF_NewFormObjectFromXObject(xo) : nullptr;
+        Check(form != nullptr, "create form object (wraps the lines as one 'picture')");
+        if (form) {
+            FS_MATRIX m{ 1, 0, 0, 1, 100, 100 };     // place the group at +100,+100
+            FPDFPageObj_SetMatrix(form, &m);
+            FPDFPage_InsertObject(dst.Page(0), form);
+            dst.ContentChanged(0);
+            dst.Bake();
+        }
+        if (xo) FPDF_CloseXObject(xo);
+
+        auto leaves = ops::ListObjects(dst, 0);
+        int paths = 0; bool undescended = false;
+        for (auto& o : leaves) { if (o.type == FPDF_PAGEOBJ_PATH) ++paths; if (o.type == FPDF_PAGEOBJ_FORM) undescended = true; }
+        Check(paths >= 3, "descend into the form: individual line objects are reachable");
+        Check(!undescended, "no opaque form container left blocking selection");
+
+        bool mapped = false;
+        for (auto& o : leaves)
+            if (o.type == FPDF_PAGEOBJ_PATH && o.bounds.l > 110 && o.bounds.l < 135 && o.bounds.b > 90) mapped = true;
+        Check(mapped, "nested line bounds mapped to page space (placement offset applied)");
+
+        FPDF_PAGEOBJECT victim = nullptr, vparent = nullptr;
+        for (auto& o : leaves) if (o.type == FPDF_PAGEOBJ_PATH) { victim = o.obj; vparent = o.parent; break; }
+        Check(vparent != nullptr, "nested line reports its Form XObject parent");
+        int before = (int)leaves.size();
+        Check(ops::PromoteObject(dst, 0, victim), "promote nested line to top level");
+        Check(ops::DeleteObjectNested(dst, 0, victim, nullptr), "delete the promoted line");
+        dst.Bake();
+        Bytes nb;
+        Check(dst.SaveBytes(nb, 0) && nb.size() > 200, "serialize after nested delete");
+        Document re; std::string e2;
+        Check(re.LoadBytes(std::make_shared<Bytes>(nb), "", e2) == Document::Load::Ok, "reload after nested delete");
+        auto leaves2 = ops::ListObjects(re, 0);
+        Check((int)leaves2.size() == before - 1, "nested deletion persisted through save + reload");
+
+        FPDF_PAGEOBJECT mover = nullptr; PRect pb0;
+        for (auto& o : leaves2) if (o.type == FPDF_PAGEOBJ_PATH) { mover = o.obj; pb0 = o.bounds; break; }
+        if (mover) {
+            Check(ops::PromoteObject(re, 0, mover), "promote nested line before move");
+            FS_MATRIX id{ 1, 0, 0, 1, 0, 0 };
+            ops::TranslateObjectPage(re, 0, mover, id, 40, -30);
+            re.Bake();
+            Bytes mb;
+            re.SaveBytes(mb, 0);
+            Document re2; std::string e3;
+            Check(re2.LoadBytes(std::make_shared<Bytes>(mb), "", e3) == Document::Load::Ok, "reload after nested move");
+            bool moved = false;
+            for (auto& o : ops::ListObjects(re2, 0))
+                if (o.type == FPDF_PAGEOBJ_PATH && std::fabs(o.bounds.l - (pb0.l + 40)) < 2.0f) moved = true;
+            Check(moved, "nested line move persisted through save + reload");
+        }
     }
     PdfShutdown();
 

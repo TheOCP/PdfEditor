@@ -13,31 +13,81 @@ PRect ObjectBounds(FPDF_PAGEOBJECT obj) {
     return PRect::FromPoints(l, b, r, t);
 }
 
+PRect ObjectPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum) {
+    PRect lb = ObjectBounds(obj);
+    float xs[4], ys[4];
+    MatApply(accum, lb.l, lb.b, xs[0], ys[0]);
+    MatApply(accum, lb.r, lb.b, xs[1], ys[1]);
+    MatApply(accum, lb.r, lb.t, xs[2], ys[2]);
+    MatApply(accum, lb.l, lb.t, xs[3], ys[3]);
+    PRect r{ xs[0], ys[0], xs[0], ys[0] };
+    for (int i = 1; i < 4; ++i) {
+        r.l = std::min(r.l, xs[i]); r.r = std::max(r.r, xs[i]);
+        r.b = std::min(r.b, ys[i]); r.t = std::max(r.t, ys[i]);
+    }
+    return r;
+}
+
+// Recursively gathers leaf objects, descending into Form XObjects. `accumParent`
+// maps the current container's space to page space.
+static void CollectLeaves(FPDF_PAGEOBJECT container, bool isPage, FPDF_PAGE page,
+                          const FS_MATRIX& accumParent, std::vector<ObjInfo>& out, int depth) {
+    if (depth > 16) return;   // guard against pathological nesting
+    int n = isPage ? FPDFPage_CountObjects(page) : FPDFFormObj_CountObjects(container);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECT o = isPage ? FPDFPage_GetObject(page, i) : FPDFFormObj_GetObject(container, (unsigned long)i);
+        if (!o) continue;
+        int type = FPDFPageObj_GetType(o);
+        if (type == FPDF_PAGEOBJ_FORM) {
+            FS_MATRIX mf{ 1, 0, 0, 1, 0, 0 };
+            FPDFPageObj_GetMatrix(o, &mf);
+            FS_MATRIX accum = MatMul(mf, accumParent);   // child space -> page space
+            size_t before = out.size();
+            CollectLeaves(o, false, nullptr, accum, out, depth + 1);
+            // A form with no drawable leaves is itself selectable (e.g. empty or opaque).
+            if (out.size() == before) {
+                ObjInfo info;
+                info.obj = o;
+                info.parent = isPage ? nullptr : container;
+                info.type = type;
+                info.accum = accumParent;
+                info.bounds = ObjectPageBounds(o, accumParent);
+                out.push_back(info);
+            }
+        } else if (type != FPDF_PAGEOBJ_UNKNOWN) {
+            ObjInfo info;
+            info.obj = o;
+            info.parent = isPage ? nullptr : container;
+            info.type = type;
+            info.accum = accumParent;
+            info.bounds = ObjectPageBounds(o, accumParent);
+            out.push_back(info);
+        }
+    }
+}
+
 std::vector<ObjInfo> ListObjects(Document& d, int page) {
     std::vector<ObjInfo> v;
     FPDF_PAGE p = d.Page(page);
     if (!p) return v;
-    int n = FPDFPage_CountObjects(p);
-    v.reserve(std::max(0, n));
-    for (int i = 0; i < n; ++i) {
-        FPDF_PAGEOBJECT o = FPDFPage_GetObject(p, i);
-        if (!o) continue;
-        ObjInfo info;
-        info.obj = o;
-        info.index = i;
-        info.type = FPDFPageObj_GetType(o);
-        info.bounds = ObjectBounds(o);
-        FPDFPageObj_GetMatrix(o, &info.matrix);
-        v.push_back(info);
-    }
+    FS_MATRIX id{ 1, 0, 0, 1, 0, 0 };
+    CollectLeaves(nullptr, true, p, id, v, 0);
     return v;
 }
 
-std::optional<ObjInfo> HitTest(Document& d, int page, float px, float py) {
+std::optional<ObjInfo> HitTest(Document& d, int page, float px, float py, float tolPt) {
     auto objs = ListObjects(d, page);
-    for (auto it = objs.rbegin(); it != objs.rend(); ++it)
-        if (it->type != FPDF_PAGEOBJ_UNKNOWN && it->bounds.Contains(px, py))
-            return *it;
+    const ObjInfo* best = nullptr;
+    float bestArea = 1e30f;
+    for (const auto& o : objs) {
+        PRect b = o.bounds;
+        b.l -= tolPt; b.b -= tolPt; b.r += tolPt; b.t += tolPt;
+        if (!b.Contains(px, py)) continue;
+        float area = std::max(1.0f, o.bounds.W()) * std::max(1.0f, o.bounds.H());
+        // Prefer the smallest (most specific) object; on a tie, the later/topmost one.
+        if (area <= bestArea) { bestArea = area; best = &o; }
+    }
+    if (best) return *best;
     return std::nullopt;
 }
 
@@ -161,6 +211,84 @@ bool DeleteObject(Document& d, int page, FPDF_PAGEOBJECT obj) {
     FPDFPageObj_Destroy(obj);
     d.ContentChanged(page);
     return true;
+}
+
+void TranslateObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
+                         float dxPage, float dyPage) {
+    if (!obj || (dxPage == 0 && dyPage == 0)) return;
+    // Convert the page-space delta into the object's own container space.
+    FS_MATRIX inv;
+    float lx = dxPage, ly = dyPage;
+    if (MatInvert(accum, inv)) {           // linear part only (ignore translation)
+        lx = inv.a * dxPage + inv.c * dyPage;
+        ly = inv.b * dxPage + inv.d * dyPage;
+    }
+    FPDFPageObj_Transform(obj, 1, 0, 0, 1, lx, ly);
+    d.ContentChanged(page);
+}
+
+void SetObjectPosPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
+                      float leftPage, float bottomPage) {
+    if (!obj) return;
+    PRect b = ObjectPageBounds(obj, accum);
+    TranslateObjectPage(d, page, obj, accum, leftPage - b.l, bottomPage - b.b);
+}
+
+bool DeleteObjectNested(Document& d, int page, FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT parent) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p || !obj) return false;
+    bool ok = parent ? (FPDFFormObj_RemoveObject(parent, obj) != 0)
+                     : (FPDFPage_RemoveObject(p, obj) != 0);
+    if (!ok) return false;
+    FPDFPageObj_Destroy(obj);
+    d.ContentChanged(page);
+    return true;
+}
+
+static bool SubtreeContains(FPDF_PAGEOBJECT form, FPDF_PAGEOBJECT target) {
+    int n = FPDFFormObj_CountObjects(form);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECT c = FPDFFormObj_GetObject(form, (unsigned long)i);
+        if (!c) continue;
+        if (c == target) return true;
+        if (FPDFPageObj_GetType(c) == FPDF_PAGEOBJ_FORM && SubtreeContains(c, target)) return true;
+    }
+    return false;
+}
+
+// Lifts every child of `form` onto `p`, baking `form`'s matrix into each, then
+// destroys `form`. Recurses so nested groups flatten completely.
+static void ExplodeFormToPage(FPDF_PAGE p, FPDF_PAGEOBJECT form) {
+    FS_MATRIX mf{ 1, 0, 0, 1, 0, 0 };
+    FPDFPageObj_GetMatrix(form, &mf);
+    std::vector<FPDF_PAGEOBJECT> kids;
+    int n = FPDFFormObj_CountObjects(form);
+    for (int i = 0; i < n; ++i)
+        if (FPDF_PAGEOBJECT c = FPDFFormObj_GetObject(form, (unsigned long)i)) kids.push_back(c);
+    for (FPDF_PAGEOBJECT c : kids) {
+        if (!FPDFFormObj_RemoveObject(form, c)) continue;
+        FPDFPageObj_Transform(c, mf.a, mf.b, mf.c, mf.d, mf.e, mf.f);   // form space -> page space
+        FPDFPage_InsertObject(p, c);
+        if (FPDFPageObj_GetType(c) == FPDF_PAGEOBJ_FORM) ExplodeFormToPage(p, c);
+    }
+    FPDFPage_RemoveObject(p, form);
+    FPDFPageObj_Destroy(form);
+}
+
+bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p || !target) return false;
+    int n = FPDFPage_CountObjects(p);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECT o = FPDFPage_GetObject(p, i);
+        if (o == target) return true;                    // already top-level
+        if (o && FPDFPageObj_GetType(o) == FPDF_PAGEOBJ_FORM && SubtreeContains(o, target)) {
+            ExplodeFormToPage(p, o);
+            d.ContentChanged(page);
+            return true;
+        }
+    }
+    return true;   // not nested under any top-level form
 }
 
 // ------------------------------------------------------------------- images

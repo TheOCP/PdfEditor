@@ -15,10 +15,17 @@ enum class Tool { Select, Text, Image, Rect, Redact, Hand };
 struct Selection {
     int page = -1;
     FPDF_PAGEOBJECT obj = nullptr;
-    uint32_t gen = 0;        // Document generation when captured
-    PRect bounds;            // page space
-    void Clear() { page = -1; obj = nullptr; }
+    FPDF_PAGEOBJECT parent = nullptr;          // containing Form XObject, null = top level
+    FS_MATRIX accum{ 1, 0, 0, 1, 0, 0 };       // container space -> page space
+    uint32_t gen = 0;                          // Document generation when captured
+    PRect bounds;                              // page space
+    void Clear() { page = -1; obj = nullptr; parent = nullptr; accum = { 1, 0, 0, 1, 0, 0 }; }
     bool Valid(Document& d) const { return obj && page >= 0 && gen == d.Generation(); }
+    void Set(Document& d, int pg, const ops::ObjInfo& o) {
+        page = pg; obj = o.obj; parent = o.parent; accum = o.accum; bounds = o.bounds; gen = d.Generation();
+    }
+    // Current page-space bounds (recomputed; nested objects move within a form).
+    PRect PageBounds() const { return obj ? ops::ObjectPageBounds(obj, accum) : bounds; }
 };
 
 // One cached page raster + the layout rectangle it occupied last frame.
@@ -154,6 +161,13 @@ public:
     // Map a screen point to (page, pageX, pageY); returns false if not over a page.
     bool ScreenToPage(ImVec2 screen, int& page, float& px, float& py);
     void SelectObjectAt(int page, float px, float py);
+    // Promotes a nested selection to a top-level object so edits persist on save.
+    // Returns true if the selection is editable afterwards.
+    bool EnsureSelectionEditable();
+    void SelectNewObject(int pg, FPDF_PAGEOBJECT o) {
+        sel.page = pg; sel.obj = o; sel.parent = nullptr;
+        sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();
+    }
     void CommitIfDirty(const std::string& label);
     void ForwardFormKey(int vk, bool down);
     void ForwardFormChar(unsigned int ch);

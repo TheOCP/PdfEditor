@@ -13,20 +13,23 @@ namespace ops {
 
 struct ObjInfo {
     FPDF_PAGEOBJECT obj = nullptr;
-    int index = -1;
-    int type = 0;            // FPDF_PAGEOBJ_*
-    PRect bounds;            // page space (points), y up
-    FS_MATRIX matrix{ 1, 0, 0, 1, 0, 0 };
+    FPDF_PAGEOBJECT parent = nullptr;   // containing Form XObject, or null at top level
+    int type = 0;                       // FPDF_PAGEOBJ_*
+    PRect bounds;                        // PAGE space (points), y up — already mapped
+    FS_MATRIX accum{ 1, 0, 0, 1, 0, 0 }; // container space -> page space
 };
 
-// Top-level objects on a page, in draw order (last = on top).
+// Every selectable leaf object on a page, descending through Form XObjects so
+// individual nested lines / images / paths are reachable (not just the container).
 std::vector<ObjInfo> ListObjects(Document& d, int page);
 
-// Topmost object whose bounds contain (px,py); nullptr if none.
-std::optional<ObjInfo> HitTest(Document& d, int page, float px, float py);
+// Smallest leaf whose (tolerance-expanded) page bounds contain (px,py); this
+// makes thin lines easy to click. tolPt is in PDF points.
+std::optional<ObjInfo> HitTest(Document& d, int page, float px, float py, float tolPt = 2.0f);
 
 int ObjectType(FPDF_PAGEOBJECT obj);
-PRect ObjectBounds(FPDF_PAGEOBJECT obj);
+PRect ObjectBounds(FPDF_PAGEOBJECT obj);                    // local (container) space
+PRect ObjectPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum);  // mapped to page space
 
 // ---- text ------------------------------------------------------------------
 
@@ -63,6 +66,24 @@ void SetObjectPos(Document& d, int page, FPDF_PAGEOBJECT obj, float leftPt, floa
 // Scales about the object's lower-left corner.
 void ScaleObject(Document& d, int page, FPDF_PAGEOBJECT obj, float sx, float sy);
 bool DeleteObject(Document& d, int page, FPDF_PAGEOBJECT obj);
+
+// --- nested-aware variants (work for objects inside Form XObjects too) ------
+// `accum` is the object's container->page matrix (ObjInfo::accum); identity for
+// a top-level object. Movement is expressed in PAGE points regardless of depth.
+void TranslateObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
+                         float dxPage, float dyPage);
+void SetObjectPosPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
+                      float leftPage, float bottomPage);
+// Removes the object from its real parent (a page or a Form XObject).
+bool DeleteObjectNested(Document& d, int page, FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT parent);
+
+// If `target` sits inside a Form XObject, flatten the whole top-level group that
+// contains it onto the page (baking each form's matrix into its children), so
+// `target` becomes a top-level page object. This is required before edits can
+// persist: FPDFPage_GenerateContent only rewrites the page stream, not the
+// stream inside a form XObject. `target`'s handle stays valid (same pointer).
+// Returns true if target is top-level afterwards (or already was).
+bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target);
 
 // ---- images ----------------------------------------------------------------
 

@@ -34,7 +34,8 @@ void App::DrawMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem("Delete selected", "Del", false, sel.Valid(doc))) {
             int pg = sel.page;
-            if (ops::DeleteObject(doc, pg, sel.obj)) { sel.Clear(); CommitIfDirty("Delete object"); }
+            EnsureSelectionEditable();
+            if (ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent)) { sel.Clear(); CommitIfDirty("Delete object"); }
         }
         ImGui::EndMenu();
     }
@@ -253,15 +254,16 @@ void App::DrawProperties() {
             int t = ops::ObjectType(sel.obj);
             const char* tn = t == FPDF_PAGEOBJ_TEXT ? "Text" : t == FPDF_PAGEOBJ_IMAGE ? "Image" :
                              t == FPDF_PAGEOBJ_PATH ? "Path/Shape" : t == FPDF_PAGEOBJ_FORM ? "Form XObject" : "Object";
-            ImGui::Text("Type: %s   (page %d)", tn, sel.page + 1);
-            PRect b = ops::ObjectBounds(sel.obj);
+            ImGui::Text("Type: %s   (page %d)%s", tn, sel.page + 1, sel.parent ? "  [inside a group]" : "");
+            PRect b = sel.PageBounds();
             float left = b.l, bottom = b.b, w = b.W(), h = b.H();
             ImGui::SetNextItemWidth(90); ImGui::DragFloat("X", &left, 0.5f, -10000, 10000, "%.1f");
             bool xEdited = ImGui::IsItemDeactivatedAfterEdit();
             ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::DragFloat("Y", &bottom, 0.5f, -10000, 10000, "%.1f");
             bool yEdited = ImGui::IsItemDeactivatedAfterEdit();
             if ((xEdited || yEdited)) {
-                ops::SetObjectPos(doc, sel.page, sel.obj, left, bottom);
+                EnsureSelectionEditable();
+                ops::SetObjectPosPage(doc, sel.page, sel.obj, sel.accum, left, bottom);
                 InvalidatePage(sel.page); CommitIfDirty("Move object");
             }
             ImGui::Text("Size: %.1f x %.1f pt", w, h);
@@ -272,11 +274,13 @@ void App::DrawProperties() {
                 ImGui::TextWrapped("Font: %s", tp.fontName.empty() ? "(embedded)" : tp.fontName.c_str());
                 ImGui::Text("Font size: %.1f pt", tp.fontSize);
                 if (ImGui::Button("Edit text...")) {
+                    EnsureSelectionEditable();
                     editing = true; editIsNew = false; editPage = sel.page; editObj = sel.obj;
                     editBuf = W2U(tp.text);
                 }
                 float col[4] = { tp.r / 255.0f, tp.g / 255.0f, tp.b / 255.0f, (tp.a ? tp.a : 255) / 255.0f };
                 if (ImGui::ColorEdit4("Text colour", col, ImGuiColorEditFlags_NoInputs)) {
+                    EnsureSelectionEditable();
                     ops::SetObjectFillColor(doc, sel.page, sel.obj, (unsigned)(col[0] * 255), (unsigned)(col[1] * 255),
                                             (unsigned)(col[2] * 255), (unsigned)(col[3] * 255));
                     InvalidatePage(sel.page);
@@ -284,6 +288,7 @@ void App::DrawProperties() {
                 if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Change colour");
                 ImGui::TextDisabled("Restyle to selected font/size:");
                 if (ImGui::Button("Apply font && size")) {
+                    EnsureSelectionEditable();
                     std::string err;
                     if (ops::RestyleText(doc, sel.page, sel.obj, CurrentFont(), fontSize, err)) {
                         sel.gen = doc.Generation(); sel.obj = nullptr; sel.Clear();
@@ -295,7 +300,8 @@ void App::DrawProperties() {
             ImGui::Separator();
             if (ImGui::Button("Delete")) {
                 int pg = sel.page;
-                if (ops::DeleteObject(doc, pg, sel.obj)) { sel.Clear(); CommitIfDirty("Delete object"); }
+                EnsureSelectionEditable();
+                if (ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent)) { sel.Clear(); CommitIfDirty("Delete object"); }
             }
         }
     }
@@ -338,7 +344,7 @@ static void DrawTextEditor(App& a) {
                                                      (unsigned)(a.fillColor[0] * 255), (unsigned)(a.fillColor[1] * 255),
                                                      (unsigned)(a.fillColor[2] * 255), err);
                     if (o) {
-                        a.sel.page = a.editPage; a.sel.obj = o; a.sel.gen = a.doc.Generation();
+                        a.SelectNewObject(a.editPage, o);
                         a.InvalidatePage(a.editPage); a.CommitIfDirty("Add text");
                         a.Toasts("Text added");
                     } else a.Toasts("Add text failed: " + err, true);

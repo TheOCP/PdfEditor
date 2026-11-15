@@ -35,15 +35,23 @@ bool App::ScreenToPage(ImVec2 s, int& page, float& px, float& py) {
 }
 
 void App::SelectObjectAt(int page, float px, float py) {
-    auto hit = ops::HitTest(doc, page, px, py);
-    if (hit) {
-        sel.page = page;
-        sel.obj = hit->obj;
-        sel.gen = doc.Generation();
-        sel.bounds = hit->bounds;
-    } else {
-        sel.Clear();
-    }
+    float tol = 4.0f / std::max(0.05f, zoom);   // ~4 screen px, in points
+    auto hit = ops::HitTest(doc, page, px, py, tol);
+    if (hit) sel.Set(doc, page, *hit);
+    else sel.Clear();
+}
+
+bool App::EnsureSelectionEditable() {
+    if (!sel.Valid(doc)) return false;
+    if (!sel.parent) return true;                 // already top-level
+    FPDF_PAGEOBJECT target = sel.obj;
+    if (!ops::PromoteObject(doc, sel.page, target)) return false;
+    // Same handle, now a top-level page object with its geometry baked in.
+    sel.parent = nullptr;
+    sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 };
+    sel.bounds = ops::ObjectBounds(target);
+    InvalidatePage(sel.page);
+    return sel.Valid(doc);
 }
 
 // Is there a form widget under this page point? Returns the annot or nullptr.
@@ -222,7 +230,7 @@ void App::DrawCanvas() {
 
     // --- selection overlay ---
     if (sel.Valid(doc) && sel.page >= 0 && cache[sel.page].laid) {
-        PRect b = ops::ObjectBounds(sel.obj);
+        PRect b = sel.PageBounds();
         sel.bounds = b;
         ImVec2 c0 = PageToScreen(*this, sel.page, b.l, b.t);
         ImVec2 c1 = PageToScreen(*this, sel.page, b.r, b.b);
@@ -275,7 +283,8 @@ void App::HandleCanvasInput(bool hovered) {
     // Delete selected object.
     if (!editing && sel.Valid(doc) && ImGui::IsKeyPressed(ImGuiKey_Delete) && formPage < 0) {
         int pg = sel.page;
-        if (ops::DeleteObject(doc, pg, sel.obj)) {
+        EnsureSelectionEditable();
+        if (ops::DeleteObjectNested(doc, pg, sel.obj, sel.parent)) {
             sel.Clear();
             CommitIfDirty("Delete object");
         }
@@ -321,7 +330,7 @@ void App::HandleCanvasInput(bool hovered) {
                         float w = std::min(sz.width * 0.5f, (float)img.w * 0.75f);
                         FPDF_PAGEOBJECT o = ops::AddImage(doc, page, img, px, py - w * img.h / img.w, w, err);
                         if (o) {
-                            sel.page = page; sel.obj = o; sel.gen = doc.Generation();
+                            SelectNewObject(page, o);
                             CommitIfDirty("Add image");
                             Toasts("Image added");
                         } else Toasts("Add image failed: " + err, true);
@@ -345,9 +354,13 @@ void App::HandleCanvasInput(bool hovered) {
         if (dragMode == 1 && sel.Valid(doc)) {
             int p2; float nx, ny;
             if (ScreenToPage(mouse, p2, nx, ny) && p2 == dragPage) {
-                ops::MoveObject(doc, dragPage, sel.obj, nx - dragLastPx, ny - dragLastPy);
-                dragLastPx = nx; dragLastPy = ny;
-                InvalidatePage(dragPage);
+                float ddx = nx - dragLastPx, ddy = ny - dragLastPy;
+                if (ddx != 0 || ddy != 0) {
+                    if (sel.parent) EnsureSelectionEditable();   // flatten the group on first real move
+                    ops::TranslateObjectPage(doc, dragPage, sel.obj, sel.accum, ddx, ddy);
+                    dragLastPx = nx; dragLastPy = ny;
+                    InvalidatePage(dragPage);
+                }
             }
         } else if (dragMode == 2 || dragMode == 3) {
             int p2; float nx, ny;
@@ -365,7 +378,7 @@ void App::HandleCanvasInput(bool hovered) {
                                              (unsigned)(fillColor[0] * 255), (unsigned)(fillColor[1] * 255), (unsigned)(fillColor[2] * 255),
                                              rectStroked, (unsigned)(strokeColor[0] * 255), (unsigned)(strokeColor[1] * 255), (unsigned)(strokeColor[2] * 255),
                                              strokeWidth);
-            if (o) { sel.page = dragPage; sel.obj = o; sel.gen = doc.Generation(); CommitIfDirty("Add rectangle"); Toasts("Rectangle added"); }
+            if (o) { SelectNewObject(dragPage, o); CommitIfDirty("Add rectangle"); Toasts("Rectangle added"); }
         } else if (dragMode == 3 && dragRect.Area() > 4) {
             int removed = ops::Redact(doc, dragPage, dragRect, 0, 0, 0);
             CommitIfDirty("Redact");
@@ -380,9 +393,10 @@ void App::HandleCanvasInput(bool hovered) {
         auto hit = ops::HitTest(doc, page, px, py);
         if (hit && hit->type == FPDF_PAGEOBJ_TEXT) {
             ops::TextProps tp = ops::ReadText(doc, page, hit->obj);
-            editing = true; editIsNew = false; editPage = page; editObj = hit->obj;
+            sel.Set(doc, page, *hit);
+            EnsureSelectionEditable();                 // flatten group so the text edit persists
+            editing = true; editIsNew = false; editPage = page; editObj = sel.obj;
             editBuf = W2U(tp.text);
-            sel.page = page; sel.obj = hit->obj; sel.gen = doc.Generation();
         }
     }
 }
