@@ -188,6 +188,7 @@ Document::Load Document::OpenFromBytes(BytesPtr bytes, const std::string& pw, st
     loadedFrom_ = bytes;
     password = pw;
     ++generation_;
+    ++docId_;
     ++edits_;
     InitForm();
     RebuildSlots();
@@ -222,6 +223,7 @@ bool Document::CreateBlank(float w, float h) {
     FPDF_PAGE p = FPDFPage_New(doc_, 0, w, h);
     if (p) FPDF_ClosePage(p);
     ++generation_;
+    ++docId_;
     InitForm();
     RebuildSlots();
     auto b = std::make_shared<Bytes>();

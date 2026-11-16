@@ -2,6 +2,15 @@
 // Editing operations layered on top of Document. Everything here mutates the
 // live PDFium page objects / page tree; callers mark the page dirty via the
 // Document and push an undo snapshot (Document::Commit) once an action settles.
+//
+// Rules every operation here follows (each learned from PDFium's behaviour):
+//  * Any transform of an existing object also transforms its clip path —
+//    FPDFPageObj_Transform alone leaves the clip behind, so moved content that
+//    has a clip (common in Word/browser/report PDFs) would vanish.
+//  * Objects inside a Form XObject must be promoted to the page before an edit,
+//    because FPDFPage_GenerateContent does not rewrite a form's own stream.
+//  * Exploding a form keeps the children at the form's place in the stacking
+//    order, so nothing jumps above or below other content.
 #include "pdf_doc.h"
 #include "imageio.h"
 #include "sysfonts.h"
@@ -23,170 +32,200 @@ struct ObjInfo {
 // individual nested lines / images / paths are reachable (not just the container).
 std::vector<ObjInfo> ListObjects(Document& d, int page);
 
-// Smallest leaf whose (tolerance-expanded) page bounds contain (px,py); this
-// makes thin lines easy to click. tolPt is in PDF points.
+// What is under (px,py)? Lines are hit by their actual geometry (distance to
+// the drawn stroke, or inside a filled shape) rather than their bounding box,
+// so clicking a table line picks the line and clicking empty cell space picks
+// nothing. Text/images are hit by their bounds. tolPt is in PDF points.
 std::optional<ObjInfo> HitTest(Document& d, int page, float px, float py, float tolPt = 2.0f);
 
 int ObjectType(FPDF_PAGEOBJECT obj);
-PRect ObjectBounds(FPDF_PAGEOBJECT obj);                    // local (container) space
-PRect ObjectPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum);  // mapped to page space
+PRect ObjectBounds(FPDF_PAGEOBJECT obj);                                // own container space
+PRect ObjectPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum);   // mapped to page space
+// Distance (points) from (px,py) to a top-level path's drawn geometry; for
+// other object types, 0 inside the bounds and the distance to them outside.
+float DistanceToObject(FPDF_PAGEOBJECT obj, float px, float py);
+// Still present on `page` (at any nesting depth)? Pointer comparison only.
+bool ObjectExists(Document& d, int page, FPDF_PAGEOBJECT obj);
+float MatrixScale(const FS_MATRIX& m);   // sqrt(|det|): uniform scale factor
 
 // ---- text ------------------------------------------------------------------
 
 struct TextProps {
     std::wstring text;
-    double fontSize = 12;
+    double fontSize = 12;                 // visual size in points (Tf x matrix scale)
+    double tf = 12;                       // raw Tf operand
     std::string fontName;                 // PDF BaseFont of the object
+    bool embedded = false;
     unsigned r = 0, g = 0, b = 0, a = 255; // fill colour
     bool isText = false;
 };
 
 TextProps ReadText(Document& d, int page, FPDF_PAGEOBJECT obj);
+// Visual font size of a text object in its container's space. Many PDFs write
+// "Tf 1" and put the size into the text matrix, so the raw Tf alone is wrong.
+float VisualFontSize(FPDF_PAGEOBJECT text);
 
-// Replaces a text object's string in place, keeping its font, size, colour and
-// position. Returns false if the object isn't text or the string can't be set.
+// Replaces a text object's string in place, keeping font, size, colour, position.
 bool SetObjectText(Document& d, int page, FPDF_PAGEOBJECT obj, const std::wstring& text);
+// Same, but if the PDF's own (often subset) font cannot show some of the typed
+// characters, the object is rebuilt with a matching installed font at the exact
+// same size, rotation and position. *replaced gets the object now holding the
+// text (== obj unless a fallback happened).
+bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::wstring& text,
+                       FPDF_PAGEOBJECT* replaced, bool* usedFallback);
 
 void SetObjectFillColor(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, unsigned a);
 
-// Creates a text object and inserts it at (px,py) = baseline origin, page space.
-// `fc` chooses the font; returns the new object or nullptr.
+// Creates a text object with its baseline origin at (px,py), page space.
 FPDF_PAGEOBJECT AddText(Document& d, int page, const std::wstring& text, const FontChoice& fc,
                         double fontSize, float px, float py, unsigned r, unsigned g, unsigned b,
                         std::string& err);
+// Adds text in the font of an existing text object (`styleFrom`, if still alive
+// in the same document) or else from raw font bytes / a matching installed font.
+FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPDF_PAGEOBJECT styleFrom,
+                            const Bytes& fontData, const std::string& fontBase, double visualSize,
+                            float px, float py, unsigned r, unsigned g, unsigned b, std::string& err);
+// Re-renders a text object in another font at `visualSize`, keeping position,
+// rotation, colour, stacking order and group tag.
+bool RestyleText(Document& d, int page, FPDF_PAGEOBJECT obj, const FontChoice& fc, double visualSize,
+                 std::string& err, FPDF_PAGEOBJECT* out = nullptr);
 
-// Re-flows a text object onto a different font / size, preserving position+colour.
-bool RestyleText(Document& d, int page, FPDF_PAGEOBJECT obj, const FontChoice& fc, double fontSize,
-                 std::string& err);
+// ---- geometry (all clip-path aware) ----------------------------------------
 
-// Adds text using a specific font given as raw font-program bytes (as captured
-// from an existing object), falling back to a system match of fontBase, then to
-// a standard font. Lets new text adopt the PDF's own font.
-FPDF_PAGEOBJECT AddTextEmbedded(Document& d, int page, const std::wstring& text, const Bytes& fontData,
-                                const std::string& fontBase, double size, float px, float py,
-                                unsigned r, unsigned g, unsigned b, std::string& err);
-
-// ---- geometry --------------------------------------------------------------
-
-void MoveObject(Document& d, int page, FPDF_PAGEOBJECT obj, float dxPt, float dyPt);
-void SetObjectPos(Document& d, int page, FPDF_PAGEOBJECT obj, float leftPt, float bottomPt);
-// Scales about the object's lower-left corner.
-void ScaleObject(Document& d, int page, FPDF_PAGEOBJECT obj, float sx, float sy);
-bool DeleteObject(Document& d, int page, FPDF_PAGEOBJECT obj);
-
-// --- nested-aware variants (work for objects inside Form XObjects too) ------
 // `accum` is the object's container->page matrix (ObjInfo::accum); identity for
 // a top-level object. Movement is expressed in PAGE points regardless of depth.
 void TranslateObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
                          float dxPage, float dyPage);
 void SetObjectPosPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& accum,
                       float leftPage, float bottomPage);
+// Maps the object's current page bounds onto `target`. Top-level objects only.
+void ResizeObjectPageTopLevel(Document& d, int page, FPDF_PAGEOBJECT obj, PRect target);
+// Applies an arbitrary page-space affine to a top-level object (group move/resize).
+void TransformObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& m);
 // Removes the object from its real parent (a page or a Form XObject).
 bool DeleteObjectNested(Document& d, int page, FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT parent);
 
 // If `target` sits inside a Form XObject, flatten the whole top-level group that
-// contains it onto the page (baking each form's matrix into its children), so
-// `target` becomes a top-level page object. This is required before edits can
-// persist: FPDFPage_GenerateContent only rewrites the page stream, not the
-// stream inside a form XObject. `target`'s handle stays valid (same pointer).
-// Returns true if target is top-level afterwards (or already was).
+// contains it onto the page so `target` becomes a top-level page object (same
+// handle). Required before an edit to a nested object can be saved.
 bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target);
-
+void PromoteAll(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& objs);
 // Breaks a top-level Form XObject into its child objects on the page.
 bool ExplodeForm(Document& d, int page, FPDF_PAGEOBJECT form);
 
-// Number of sub-paths (MoveTo-started runs) in a path object.
+// Moves the very same object to another page (keeps its font, image data,
+// clip, everything), shifted by (dx,dy) page points. Top-level objects only.
+bool MoveObjectToPage(Document& d, int srcPage, FPDF_PAGEOBJECT obj, int dstPage, float dx, float dy);
+
+// ---- splitting shared paths -------------------------------------------------
+
 int SubpathCount(FPDF_PAGEOBJECT obj);
-// Splits a single path object that draws several lines (sub-paths) into one
-// path object per sub-path, so each line can be moved on its own. Preserves
-// matrix, colours, stroke width and any group tag. Returns the new objects
-// (empty if the path has fewer than 2 sub-paths). Top-level objects only.
+// How many movable pieces SplitPath would produce (0 = nothing to split):
+// several sub-paths -> one piece each; one stroked outline (e.g. a table cell
+// drawn as a rectangle) -> one piece per side.
+int SplittableParts(FPDF_PAGEOBJECT obj);
+// Splits a path into independent line objects (see SplittableParts). A filled
+// and stroked outline keeps its fill as a separate fill-only shape underneath.
+// Curves, dash patterns, caps/joins, colours and group tags are preserved.
+// Returns the line pieces. Top-level objects only.
 std::vector<FPDF_PAGEOBJECT> SplitPath(Document& d, int page, FPDF_PAGEOBJECT obj);
 
 // ---- images ----------------------------------------------------------------
 
-// Places `img` with its lower-left at (px,py), drawn `widthPt` wide (height
-// follows the aspect ratio). Returns the new image object or nullptr.
 FPDF_PAGEOBJECT AddImage(Document& d, int page, const Image& img, float px, float py, float widthPt,
                          std::string& err);
+// Full-resolution pixels of an image object (straight BGRA), ignoring masks.
+bool ImagePixels(FPDF_PAGEOBJECT img, Image& out);
+// Lifts the part of a picture inside `box` out into its own movable image
+// object; the hole left behind is filled with the surrounding background
+// colour. Works for scanned pages where every "line" is just pixels.
+// Returns the new piece (top-level) or nullptr.
+FPDF_PAGEOBJECT CutImageRegion(Document& d, int page, FPDF_PAGEOBJECT img, PRect box, std::string& err);
 
-// ---- shapes / redaction ----------------------------------------------------
+// ---- shapes ------------------------------------------------------------------
 
 FPDF_PAGEOBJECT AddRect(Document& d, int page, PRect box, bool fill, unsigned fr, unsigned fg, unsigned fb,
                         bool stroke, unsigned sr, unsigned sg, unsigned sb, float strokeW);
-
-// A single straight line segment as its own editable stroked path object.
 FPDF_PAGEOBJECT AddLine(Document& d, int page, float x1, float y1, float x2, float y2,
                         unsigned r, unsigned g, unsigned b, float width);
-
-// Builds a table/grid as individual line objects inside `box`, so every line can
-// be selected, moved, resized or deleted on its own. `cols`/`rows` are the body
-// divisions; `header` adds a separator line `headerH` points below the top edge.
-// Returns the number of line objects created.
 int AddTable(Document& d, int page, PRect box, int cols, int rows, bool header, float headerH,
              unsigned r, unsigned g, unsigned b, float width);
 
-// Maps the object's current page bounds onto `target` (scale + reposition).
-// Top-level objects only — promote first. Degenerate axes (e.g. a line's
-// thickness) are left unscaled so lines keep their width.
-void ResizeObjectPageTopLevel(Document& d, int page, FPDF_PAGEOBJECT obj, PRect target);
-
-// Stroke of a path object (line colour + width).
 struct StrokeProps { bool isPath = false; float width = 1; unsigned r = 0, g = 0, b = 0, a = 255; };
 StrokeProps ReadStroke(FPDF_PAGEOBJECT obj);
 void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width);
-
-// Orientation-agnostic line thickness (works for horizontal and vertical lines,
-// whether they are stroked hairlines or thin filled bars).
+// Visible line thickness in page points: stroke width x matrix scale for a
+// stroked line, the short side for a filled bar. Works in any orientation.
 float LineThickness(FPDF_PAGEOBJECT obj);
 void  SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick);
 
-// Applies an arbitrary affine to a top-level object (used for group move/resize).
-void TransformObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& m);
-
 // ---- grouping ------------------------------------------------------------
-// Objects are grouped by a persistent content-mark tag ("PEGroup"/id) that
-// survives save + reload, so a set of lines can act as one object and be split
-// again. Grouping needs top-level objects (promote nested ones first).
+// Persistent "PEGroup"/id content-mark tag; survives save + reload.
 int  GetGroupId(FPDF_PAGEOBJECT obj);                 // 0 = ungrouped
 void SetGroupId(Document& d, int page, FPDF_PAGEOBJECT obj, int id);
 void ClearGroupId(Document& d, int page, FPDF_PAGEOBJECT obj);
-int  MaxGroupId(Document& d);                         // highest id in use (0 if none)
+int  MaxGroupId(Document& d);
 std::vector<FPDF_PAGEOBJECT> GroupMembers(Document& d, int page, int id);
 
-// ---- clipboard (copy objects, incl. across pages) ------------------------
-// A self-contained description of one page object, enough to rebuild it on any
-// page of the same document. Text keeps its real embedded font bytes so copies
-// look identical; straight paths (table lines) copy exactly, beziers approximate.
+// ---- clipboard ---------------------------------------------------------------
+// Self-contained description of one object, enough to rebuild it on any page.
+// While the source object still exists, pasted text reuses its exact font.
 struct ClipObject {
     int type = 0;
     FS_MATRIX matrix{ 1, 0, 0, 1, 0, 0 };
+    PRect bounds;                        // page space at capture time
     int groupId = 0;
+    // source identity (for exact font reuse)
+    FPDF_PAGEOBJECT srcObj = nullptr;
+    int srcPage = -1;
+    uint32_t srcGen = 0;
     // text
     std::wstring text;
-    double fontSize = 12;
+    double fontSize = 12;                // raw Tf
+    double visualSize = 12;              // Tf x matrix scale
     std::string fontBase;
-    Bytes fontData;
+    Bytes fontData;                      // only for genuinely embedded fonts
     int textRender = 0;
     // path
     struct Seg { int type = 0; float x = 0, y = 0; bool close = false; };
     std::vector<Seg> segs;
     int fillMode = 0;
     bool stroke = false;
+    std::vector<float> dash;
+    float dashPhase = 0;
+    int lineCap = -1, lineJoin = -1;
     // colours (fill for text/path, stroke for path)
     unsigned fr = 0, fg = 0, fb = 0, fa = 255, sr = 0, sg = 0, sb = 0, sa = 255;
     float strokeW = 1;
     // image
-    Image image;
+    Image image;                         // full resolution pixels
+    Bytes jpeg;                          // original JPEG bytes (copied losslessly)
 };
 
 bool CaptureObject(Document& d, int page, FPDF_PAGEOBJECT obj, ClipObject& out);
 FPDF_PAGEOBJECT PasteObject(Document& d, int page, const ClipObject& c, float dxPage, float dyPage,
                             int newGroupId, std::string& err);
+PRect ClipBounds(const std::vector<ClipObject>& clip);
 
-// Removes every top-level object fully inside `box`, then paints `box` solid.
-// This actually deletes the covered content (unlike a black highlight on top).
-int Redact(Document& d, int page, PRect box, unsigned r, unsigned g, unsigned b);
+// ---- redaction ---------------------------------------------------------------
+// True redaction: covered characters are removed from text (the rest of each
+// line is rebuilt in place, same font and position), objects inside the box
+// are deleted, pictures under the box get their pixels blacked out, and
+// annotations / form fields touching the box are removed. Then the box is
+// painted. Verified: removed text and replaced pixels are not left in the file.
+struct RedactResult { int removed = 0, textSplit = 0, imagesMasked = 0, annotsRemoved = 0; };
+RedactResult Redact(Document& d, int page, PRect box, unsigned r, unsigned g, unsigned b);
+
+// ---- annotations ---------------------------------------------------------------
+
+struct AnnotInfo { int index = -1; int subtype = 0; PRect rect; };
+std::optional<AnnotInfo> AnnotAt(Document& d, int page, float px, float py, float tolPt, bool includeWidgets);
+bool AnnotRect(Document& d, int page, int index, PRect& out);
+// Moves an annotation (rect + its quad points / ink strokes).
+bool MoveAnnot(Document& d, int page, int index, float dx, float dy);
+bool DeleteAnnot(Document& d, int page, int index);
+// Turns this page's annotations and form fields into normal page content.
+bool FlattenPage(Document& d, int page);
 
 // ---- text extraction / search ---------------------------------------------
 
@@ -206,14 +245,12 @@ bool DeletePages(Document& d, const std::vector<int>& pages);   // 0-based
 bool MovePage(Document& d, int from, int to);
 bool RotatePage(Document& d, int page, int quartersCW);         // relative
 bool DuplicatePage(Document& d, int page);
-// Appends (or inserts at `at`, -1 = end) pages `range` ("1-3,5") from another PDF file.
 bool ImportPagesFromFile(Document& d, const std::wstring& file, const std::string& pw,
                          const std::string& range, int at, std::string& err);
-// Renders each page of `img`-like source? no — rasterizes selected pages to PNGs.
 bool ExportPagesToImages(Document& d, const std::vector<int>& pages, const std::wstring& dir,
                          float dpi, std::string& err);
 
-// ---- forms / annotations ---------------------------------------------------
+// ---- forms ---------------------------------------------------------------------
 
 struct FieldInfo {
     int page;
@@ -223,11 +260,10 @@ struct FieldInfo {
     PRect box;
 };
 std::vector<FieldInfo> ListFormFields(Document& d);
-// Bakes annotations + form fields into page content so values can't be changed.
 bool FlattenAll(Document& d);
 
 // ---- metadata --------------------------------------------------------------
 
-std::wstring GetMeta(Document& d, const char* key);   // "Title","Author","Subject","Keywords","Creator","Producer"
+std::wstring GetMeta(Document& d, const char* key);
 
 } // namespace ops

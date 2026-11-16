@@ -4,6 +4,11 @@
 #include "pdf_doc.h"
 #include "pdf_ops.h"
 #include "sysfonts.h"
+#include "imageio.h"
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <string>
 #include <windows.h>
 #include <cstdio>
 #include <cmath>
@@ -22,6 +27,318 @@ static void Out(const char* fmt, ...) {
 static void Check(bool cond, const char* what) {
     Out(cond ? "[ ok ] %s\n" : "[FAIL] %s\n", what);
     if (!cond) ++g_fail;
+}
+
+// ---- helpers for the editing tests -----------------------------------------
+
+// A one-page PDF (612x792, Helvetica as /F1) whose content stream is `content`.
+static std::shared_ptr<Bytes> MakePdf(const std::string& content) {
+    std::vector<std::string> objs = {
+        "<</Type/Catalog/Pages 2 0 R>>",
+        "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>",
+        "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        "<</Length " + std::to_string(content.size()) + ">>stream\n" + content + "endstream",
+    };
+    std::string pdf = "%PDF-1.4\n";
+    std::vector<size_t> off;
+    for (size_t i = 0; i < objs.size(); ++i) { off.push_back(pdf.size()); pdf += std::to_string(i + 1) + " 0 obj\n" + objs[i] + "\nendobj\n"; }
+    size_t xref = pdf.size();
+    pdf += "xref\n0 " + std::to_string(objs.size() + 1) + "\n0000000000 65535 f \n";
+    char b[32];
+    for (size_t o : off) { snprintf(b, sizeof b, "%010zu 00000 n \n", o); pdf += b; }
+    pdf += "trailer\n<</Size " + std::to_string(objs.size() + 1) + "/Root 1 0 R>>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+    return std::make_shared<Bytes>(pdf.begin(), pdf.end());
+}
+
+static uint32_t PixelAt(Document& d, int page, float px, float py) {
+    FS_SIZEF sz = d.PageSizePt(page);
+    int w = (int)sz.width, h = (int)sz.height;
+    std::vector<uint32_t> buf;
+    if (!d.Render(page, 1.0f, 0, 0, w, h, buf, true, true)) return 0xFFFFFF;
+    float dx, dy;
+    d.PageToDev(page, 1.0f, px, py, dx, dy);
+    int x = std::clamp((int)dx, 0, w - 1), y = std::clamp((int)dy, 0, h - 1);
+    return buf[(size_t)y * w + x] & 0xFFFFFF;
+}
+static bool Dark(uint32_t c) { return (c & 255) + ((c >> 8) & 255) + ((c >> 16) & 255) < 200; }
+
+static std::shared_ptr<Bytes> Saved(Document& d) {
+    d.Bake();
+    auto b = std::make_shared<Bytes>();
+    d.SaveBytes(*b, 0);
+    return b;
+}
+
+static int JpegBlock(void* param, unsigned long pos, unsigned char* buf, unsigned long size) {
+    const Bytes* b = static_cast<const Bytes*>(param);
+    if ((uint64_t)pos + size > b->size()) return 0;
+    memcpy(buf, b->data() + pos, size);
+    return 1;
+}
+
+static void RunEditTests() {
+    std::string e;
+    FontChoice helv; helv.stdName = "Helvetica";
+    FS_MATRIX id{ 1, 0, 0, 1, 0, 0 };
+
+    Out("\nMoving content that has a clip path:\n");
+    {
+        Document d;
+        d.LoadBytes(MakePdf("q 50 350 300 100 re W n 6 w 0 G 0 400 m 600 400 l S Q\n"), "", e);
+        FPDF_PAGEOBJECT ln = nullptr;
+        for (auto& o : ops::ListObjects(d, 0)) if (o.type == FPDF_PAGEOBJ_PATH) ln = o.obj;
+        Check(ln && Dark(PixelAt(d, 0, 200, 400)), "clipped line visible before the move");
+        ops::TranslateObjectPage(d, 0, ln, id, 0, 100);
+        Check(Dark(PixelAt(d, 0, 200, 500)), "moved line is still visible (its clip moved with it)");
+        Document r;
+        r.LoadBytes(Saved(d), "", e);
+        Check(Dark(PixelAt(r, 0, 200, 500)), "...and still visible after save + reload");
+    }
+
+    Out("\nUngrouping keeps the stacking order:\n");
+    {
+        Document src;
+        src.CreateBlank(612, 792);
+        ops::AddLine(src, 0, 100, 400, 500, 400, 0, 0, 0, 8);
+        src.Bake();
+        Document dst;
+        dst.CreateBlank(612, 792);
+        FPDF_XOBJECT xo = FPDF_NewXObjectFromPage(dst.Raw(), src.Raw(), 0);
+        FPDF_PAGEOBJECT form = FPDF_NewFormObjectFromXObject(xo);
+        FPDFPage_InsertObject(dst.Page(0), form);                                     // bottom
+        ops::AddRect(dst, 0, { 50, 350, 550, 450 }, true, 255, 255, 255, false, 0, 0, 0, 1); // white cover on top
+        FPDF_CloseXObject(xo);
+        Check(!Dark(PixelAt(dst, 0, 300, 400)), "line hidden under the white box");
+        FPDF_PAGEOBJECT inner = nullptr;
+        for (auto& o : ops::ListObjects(dst, 0)) if (o.type == FPDF_PAGEOBJ_PATH && o.parent) inner = o.obj;
+        ops::PromoteObject(dst, 0, inner);
+        Check(!Dark(PixelAt(dst, 0, 300, 400)), "after ungrouping the line is still under the box");
+    }
+
+    Out("\nCopying curves, dashes, fonts and pictures exactly:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        ops::InsertBlankPage(d, 1, 612, 792);
+        FPDF_PAGEOBJECT p = FPDFPageObj_CreateNewPath(100, 100);
+        FPDFPath_BezierTo(p, 150, 200, 250, 200, 300, 100);
+        FPDFPath_SetDrawMode(p, FPDF_FILLMODE_NONE, 1);
+        FPDFPageObj_SetStrokeWidth(p, 2);
+        FPDFPageObj_SetStrokeColor(p, 0, 0, 0, 255);
+        FPDFPage_InsertObject(d.Page(0), p);
+        d.ContentChanged(0);
+        ops::ClipObject c;
+        ops::CaptureObject(d, 0, p, c);
+        FPDF_PAGEOBJECT q = ops::PasteObject(d, 0, c, 0, -50, 0, e);
+        int bez = 0;
+        for (int i = 0; q && i < FPDFPath_CountSegments(q); ++i)
+            if (FPDFPathSegment_GetType(FPDFPath_GetPathSegment(q, i)) == FPDF_SEGMENT_BEZIERTO) ++bez;
+        Check(q && bez == 3, "a pasted curve is still a curve (not straightened)");
+
+        FPDF_PAGEOBJECT l = ops::AddLine(d, 0, 100, 300, 400, 300, 0, 0, 0, 1);
+        float dash[2] = { 3, 2 };
+        FPDFPageObj_SetDashArray(l, dash, 2, 0);
+        ops::CaptureObject(d, 0, l, c);
+        FPDF_PAGEOBJECT l2 = ops::PasteObject(d, 0, c, 0, -20, 0, e);
+        Check(l2 && FPDFPageObj_GetDashCount(l2) == 2, "a pasted dotted line stays dotted");
+
+        const SysFont* arial = MatchSystemFont("Arial");
+        FontChoice ar = arial ? ChoiceFor(*arial) : helv;
+        FPDF_PAGEOBJECT t = ops::AddText(d, 0, L"Kontostand 987,65", ar, 12, 72, 700, 0, 0, 0, e);
+        ops::CaptureObject(d, 0, t, c);
+        FPDF_PAGEOBJECT tq = ops::PasteObject(d, 1, c, 0, 0, 0, e);
+        Check(tq && FPDFTextObj_GetFont(tq) == FPDFTextObj_GetFont(t), "copied text uses the exact same font as the original");
+        Document r;
+        r.LoadBytes(Saved(d), "", e);
+        Check(ops::ExtractText(r, 1).find(L"Kontostand 987,65") != std::wstring::npos, "copied text is intact on page 2 after reload");
+
+        Image img;
+        img.w = 400; img.h = 200;
+        img.px.assign((size_t)img.w * img.h, 0xFF3366CCu);
+        FPDF_PAGEOBJECT im = ops::AddImage(d, 0, img, 100, 450, 100, e);   // 400 px shown 100 pt wide
+        ops::CaptureObject(d, 0, im, c);
+        FPDF_PAGEOBJECT iq = ops::PasteObject(d, 0, c, 0, 100, 0, e);
+        unsigned w = 0, h = 0;
+        if (iq) FPDFImageObj_GetImagePixelSize(iq, &w, &h);
+        Check(w == 400 && h == 200, "a copied picture keeps its full resolution");
+
+        wchar_t tmpDir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmpDir);
+        std::wstring jpgPath = std::wstring(tmpDir) + L"pdfeditor_selftest.jpg";
+        Image small;
+        small.w = 64; small.h = 64;
+        small.px.assign(64 * 64, 0xFF808080u);
+        Bytes jb;
+        if (SaveImageFile(jpgPath, small.px.data(), 64, 64, e) && ReadFileBytes(jpgPath, jb)) {
+            FPDF_PAGEOBJECT ji = FPDFPageObj_NewImageObj(d.Raw());
+            FPDF_FILEACCESS fa{};
+            fa.m_FileLen = (unsigned long)jb.size();
+            fa.m_GetBlock = JpegBlock;
+            fa.m_Param = &jb;
+            FPDFImageObj_LoadJpegFileInline(nullptr, 0, ji, &fa);
+            FS_MATRIX m{ 64, 0, 0, 64, 300, 300 };
+            FPDFPageObj_SetMatrix(ji, &m);
+            FPDFPage_InsertObject(d.Page(0), ji);
+            d.ContentChanged(0);
+            ops::CaptureObject(d, 0, ji, c);
+            Check(!c.jpeg.empty(), "a JPEG picture is captured as its original JPEG bytes");
+            FPDF_PAGEOBJECT jq = ops::PasteObject(d, 0, c, 80, 0, 0, e);
+            char filt[32] = { 0 };
+            if (jq) FPDFImageObj_GetImageFilter(jq, 0, filt, sizeof(filt) - 1);
+            Check(jq && strcmp(filt, "DCTDecode") == 0, "the pasted copy is still a JPEG (lossless, small file)");
+            DeleteFileW(jpgPath.c_str());
+        } else {
+            Check(false, "could not create the test JPEG");
+        }
+    }
+
+    Out("\nSplitting table cells into sides:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        FPDF_PAGEOBJECT cell = ops::AddRect(d, 0, { 100, 100, 300, 200 }, false, 0, 0, 0, true, 0, 0, 0, 1);
+        Check(ops::SplittableParts(cell) == 4, "an outlined table cell counts as 4 sides");
+        auto sides = ops::SplitPath(d, 0, cell);
+        Check(sides.size() == 4, "the cell splits into 4 separate lines");
+        if (sides.size() == 4) {
+            PRect other = ops::ObjectBounds(sides[1]);
+            PRect mine = ops::ObjectBounds(sides[0]);
+            ops::TranslateObjectPage(d, 0, sides[0], id, 0, 30);
+            PRect other2 = ops::ObjectBounds(sides[1]);
+            Check(std::fabs(ops::ObjectBounds(sides[0]).b - (mine.b + 30)) < 0.5f && std::fabs(other2.b - other.b) < 0.01f,
+                  "one side moves on its own; the others stay");
+        }
+        FPDF_PAGEOBJECT filled = ops::AddRect(d, 0, { 350, 100, 500, 200 }, true, 200, 200, 255, true, 0, 0, 0, 1);
+        auto s2 = ops::SplitPath(d, 0, filled);
+        int paths = 0;
+        for (auto& o : ops::ListObjects(d, 0)) if (o.type == FPDF_PAGEOBJ_PATH) ++paths;
+        uint32_t inside = PixelAt(d, 0, 425, 150);
+        Check(s2.size() == 4 && paths == 9 && ((inside & 255) > 230 && ((inside >> 16) & 255) < 230),
+              "a filled + outlined cell: 4 movable sides, and its fill stays underneath");
+    }
+
+    Out("\nMoving objects between pages:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        ops::InsertBlankPage(d, 1, 612, 792);
+        FPDF_PAGEOBJECT t = ops::AddText(d, 0, L"Umzug 1.234,56", helv, 14, 72, 700, 0, 0, 0, e);
+        Check(ops::MoveObjectToPage(d, 0, t, 1, 0, -100), "move a text object onto page 2");
+        Document r;
+        r.LoadBytes(Saved(d), "", e);
+        Check(ops::ExtractText(r, 1).find(L"Umzug 1.234,56") != std::wstring::npos &&
+              ops::ExtractText(r, 0).find(L"Umzug") == std::wstring::npos, "after reload the text is on page 2 only");
+    }
+
+    Out("\nText size and font when editing:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        FPDF_PAGEOBJECT t1 = FPDFPageObj_NewTextObj(d.Raw(), "Helvetica", 1.0f);
+        FPDFText_SetText(t1, WS(L"Tf one"));
+        FS_MATRIX m{ 10, 0, 0, 10, 72, 600 };
+        FPDFPageObj_SetMatrix(t1, &m);
+        FPDFPage_InsertObject(d.Page(0), t1);
+        d.ContentChanged(0);
+        Check(std::fabs(ops::VisualFontSize(t1) - 10.0f) < 0.01f, "size reads as 10 pt even when stored as Tf 1 x matrix 10");
+
+        FPDF_PAGEOBJECT t2 = ops::AddText(d, 0, L"Saldo", helv, 12, 72, 500, 0, 0, 0, e);
+        FS_MATRIX m0{ 1, 0, 0, 1, 0, 0 };
+        FPDFPageObj_GetMatrix(t2, &m0);
+        FPDF_PAGEOBJECT rep = nullptr;
+        bool fb = true;
+        bool ok = ops::SetObjectTextSafe(d, 0, t2, L"Saldo 1.234,56 \x20AC", &rep, &fb);
+        Check(ok && !fb && rep == t2, "editing keeps the original font when it has the characters");
+        float before = ops::VisualFontSize(t2);
+        ok = ops::SetObjectTextSafe(d, 0, t2, L"\x041F\x0440\x0438\x0432\x0435\x0442", &rep, &fb);
+        FS_MATRIX m1{ 1, 0, 0, 1, 0, 0 };
+        if (rep) FPDFPageObj_GetMatrix(rep, &m1);
+        Check(ok && fb, "characters the PDF font lacks switch to a matching installed font");
+        Check(rep && std::fabs(ops::VisualFontSize(rep) - before) < 0.01f && m1.e == m0.e && m1.f == m0.f,
+              "that fallback keeps the exact size and position");
+        Check(ops::ExtractText(d, 0).find(L"\x041F\x0440\x0438\x0432\x0435\x0442") != std::wstring::npos,
+              "the new characters are really there");
+    }
+
+    Out("\nTrue redaction:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        ops::AddText(d, 0, L"IBAN DE12 3456 7890", helv, 14, 72, 700, 0, 0, 0, e);
+        auto hits = ops::SearchText(d, L"3456", false, false);
+        Check(!hits.empty(), "found the digits to redact");
+        if (!hits.empty()) {
+            ops::RedactResult rr = ops::Redact(d, 0, hits[0].box, 0, 0, 0);
+            Document r;
+            r.LoadBytes(Saved(d), "", e);
+            std::wstring tx = ops::ExtractText(r, 0);
+            Check(tx.find(L"3456") == std::wstring::npos, "the covered digits are gone from the saved file");
+            Check(tx.find(L"IBAN") != std::wstring::npos && tx.find(L"7890") != std::wstring::npos,
+                  "the rest of the line is kept");
+            Check(rr.textSplit == 1, "the line was cut, not deleted");
+        }
+        Image g;
+        g.w = 100; g.h = 100;
+        g.px.assign(100 * 100, 0xFF00AA00u);
+        FPDF_PAGEOBJECT im = ops::AddImage(d, 0, g, 300, 300, 100, e);
+        ops::RedactResult r2 = ops::Redact(d, 0, { 320, 320, 360, 360 }, 0, 0, 0);
+        Image after;
+        bool got = ops::ImagePixels(im, after);
+        Check(r2.imagesMasked == 1 && got && (after.px[60 * 100 + 40] & 0xFFFFFF) == 0,
+              "picture pixels under the box are blacked out");
+    }
+
+    Out("\nCutting a piece out of a picture (scanned lines):\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        Image scan;
+        scan.w = 200; scan.h = 200;
+        scan.px.assign(200 * 200, 0xFFFFFFFFu);
+        for (int y = 98; y <= 102; ++y)
+            for (int x = 0; x < 200; ++x) scan.px[(size_t)y * 200 + x] = 0xFF000000u;
+        FPDF_PAGEOBJECT im = ops::AddImage(d, 0, scan, 100, 100, 200, e);   // 1 px per pt; row 100 at y=200
+        FPDF_PAGEOBJECT piece = ops::CutImageRegion(d, 0, im, { 90, 195, 310, 205 }, e);
+        Check(piece != nullptr, "cut the line out of the scan as its own piece");
+        Image pp, rest;
+        bool g1 = piece && ops::ImagePixels(piece, pp), g2 = ops::ImagePixels(im, rest);
+        bool pieceHasLine = g1 && std::any_of(pp.px.begin(), pp.px.end(), [](uint32_t q) { return (q & 0xFFFFFF) == 0; });
+        Check(pieceHasLine, "the piece contains the line");
+        Check(g2 && (rest.px[100 * 200 + 50] & 0xFFFFFF) == 0xFFFFFF, "the hole is filled with the paper colour");
+        if (piece) {
+            PRect b0 = ops::ObjectBounds(piece);
+            ops::TranslateObjectPage(d, 0, piece, id, 0, -40);
+            Check(std::fabs(ops::ObjectBounds(piece).b - (b0.b - 40)) < 0.5f && Dark(PixelAt(d, 0, 200, 160)),
+                  "the piece can be moved (the line is now 40 pt lower)");
+        }
+    }
+
+    Out("\nAnnotations and precise clicking:\n");
+    {
+        Document d;
+        d.CreateBlank(612, 792);
+        FPDF_ANNOTATION an = FPDFPage_CreateAnnot(d.Page(0), FPDF_ANNOT_SQUARE);
+        FS_RECTF rc{ 100, 500, 200, 450 };    // left, top, right, bottom
+        FPDFAnnot_SetRect(an, &rc);
+        FPDFPage_CloseAnnot(an);
+        auto ai = ops::AnnotAt(d, 0, 150, 475, 1, false);
+        Check(ai.has_value(), "an annotation is found under the mouse");
+        if (ai) {
+            ops::MoveAnnot(d, 0, ai->index, 10, 20);
+            PRect r;
+            ops::AnnotRect(d, 0, ai->index, r);
+            Check(std::fabs(r.l - 110) < 0.01f && std::fabs(r.b - 470) < 0.01f, "the annotation moved by (10, 20)");
+        }
+        FPDF_PAGEOBJECT cell = ops::AddRect(d, 0, { 100, 100, 300, 300 }, false, 0, 0, 0, true, 0, 0, 0, 1);
+        FPDF_PAGEOBJECT word = ops::AddText(d, 0, L"Wert", helv, 14, 104, 200, 0, 0, 0, e);
+        auto h1 = ops::HitTest(d, 0, 250, 250, 2);
+        auto h2 = ops::HitTest(d, 0, 100.4f, 250, 2);
+        auto h3 = ops::HitTest(d, 0, 115, 204, 2);
+        Check(!h1, "clicking empty space inside a table cell selects nothing");
+        Check(h2 && h2->obj == cell, "clicking right on the cell's border line selects it");
+        Check(h3 && h3->obj == word, "clicking text next to the border selects the text");
+    }
 }
 
 int RunSelfTest() {
@@ -313,6 +630,7 @@ int RunSelfTest() {
             Check(moved, "nested line move persisted through save + reload");
         }
     }
+    RunEditTests();
     PdfShutdown();
 
     Out("\n%s  (%d failure%s)\n", g_fail == 0 ? "ALL PASSED" : "FAILURES", g_fail, g_fail == 1 ? "" : "s");

@@ -7,10 +7,9 @@
 #include "pdf_ops.h"
 #include "gfx.h"
 #include "sysfonts.h"
-#include <deque>
 #include <memory>
 
-enum class Tool { Select, Text, Image, Rect, Redact, Hand };
+enum class Tool { Select, Text, Image, Rect, Redact, Cut, Hand };
 
 struct Selection {
     int page = -1;
@@ -24,19 +23,25 @@ struct Selection {
     void Set(Document& d, int pg, const ops::ObjInfo& o) {
         page = pg; obj = o.obj; parent = o.parent; accum = o.accum; bounds = o.bounds; gen = d.Generation();
     }
-    // Current page-space bounds (recomputed; nested objects move within a form).
     PRect PageBounds() const { return obj ? ops::ObjectPageBounds(obj, accum) : bounds; }
 };
 
-// One cached page raster + the layout rectangle it occupied last frame.
+// One cached page raster. At normal zoom it covers the whole page; at high zoom
+// it covers only the visible part (a tile) so the page stays sharp.
 struct PageTex {
     Texture tex;
     uint32_t version = ~0u;
-    float scale = 0;         // device px per point it was rendered at
-    // screen-space rect from the last laid-out frame (for hit testing)
-    ImVec2 topLeft{ 0, 0 };
-    float dispW = 0, dispH = 0;  // on-screen size in pixels
+    float scale = 0;             // device px per point it was rendered at
+    int tx = 0, ty = 0, tw = 0, th = 0;   // covered region, in display pixels of the page
+    ImVec2 topLeft{ 0, 0 };      // screen rect of the page last frame (for hit testing)
+    float dispW = 0, dispH = 0;
     bool laid = false;
+};
+
+struct ThumbTex {
+    Texture tex;
+    uint32_t version = ~0u;
+    int w = 0;
 };
 
 struct Toast {
@@ -50,6 +55,9 @@ public:
     void Init(HWND hwnd);
     void Draw();
     void Shutdown();
+    // Asks to save unsaved changes. Returns false if the user cancelled.
+    bool ConfirmDiscard();
+    float dpiScale = 1.0f;
 
     // --- commands (app.cpp) ---
     void NewDoc();
@@ -60,17 +68,20 @@ public:
     void Undo();
     void Redo();
     void DoFlatten();
-    void ExportImagesDialog();
+    void FlattenCurrentPage();
+    void ExportImagesDialog(float dpi);
     void ExtractTextDialog();
-
     void Toasts(const std::string& msg, bool error = false);
 
     // --- canvas (canvas.cpp) ---
     void DrawCanvas();
-    void HandleCanvasInput(bool hovered);
+    void HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region);
     void InvalidatePage(int i);
     void InvalidateAll();
     void ScrollToPage(int i);
+    void ScrollToRect(int page, PRect r);
+    ImVec2 PageToScreenPt(int page, float px, float py);
+    bool ScreenToPage(ImVec2 screen, int& page, float& px, float& py);
 
     // --- panels (panels.cpp) ---
     void DrawMenuBar();
@@ -79,8 +90,53 @@ public:
     void DrawProperties();
     void DrawSearchBar();
     void DrawModals();
+    void DrawInlineEditor();
 
-    // state ------------------------------------------------------------------
+    // --- inline text editing ---
+    void BeginEditText(int page, FPDF_PAGEOBJECT obj);
+    void BeginNewText(int page, float px, float py);
+    void CommitInlineEdit();
+    void CancelInlineEdit();
+
+    // --- selection ---
+    void SelectObjectAt(int page, float px, float py);
+    bool EnsureSelectionEditable();             // promote a nested selection to the page
+    void ClearSelection();
+    void SelectAllOnPage(bool linesOnly);
+    void GroupAllLines();
+    void RefreshGroupSel();
+    PRect SelectionBounds();
+    void MoveSelection(float dxPage, float dyPage);
+    void ResizeSelectionTo(PRect target);
+    void DeleteSelection();
+    void GroupSelection();
+    void UngroupSelection();
+    void SplitSelectedPath(bool pickNearest, float px, float py);
+    void SelectNewObject(int pg, FPDF_PAGEOBJECT o);
+    void SelectObjects(int pg, const std::vector<FPDF_PAGEOBJECT>& objs, int groupId);
+    void CutPieceFromImage(int page, PRect box);
+
+    // --- annotations ---
+    bool AnnotSelected() const { return annSelPage >= 0 && annSelIdx >= 0; }
+    void ClearAnnotSel() { annSelPage = -1; annSelIdx = -1; }
+
+    // --- clipboard / cross-page ---
+    void CopySelection();
+    void CutSelection();
+    void PasteClipboard(bool atCursor);         // in place, or at the mouse
+    void PasteAt(int page, float px, float py); // "Paste here"
+    void TransferSelectionToPage(int tp, float dx = 0, float dy = 0);
+    void ClearLimbo();
+
+    void CommitIfDirty(const std::string& label);
+    void ForwardFormKey(int vk, bool down);
+    void ForwardFormChar(unsigned int ch);
+    void EndFormFocus();
+
+    const std::vector<FontChoice>& FontList();
+    FontChoice CurrentFont();
+
+    // ============================== state
     HWND hwnd_ = nullptr;
     Document doc;
     Tool tool = Tool::Select;
@@ -93,9 +149,17 @@ public:
     bool showThumbs = true;
     bool showProps = true;
     int pendingScrollPage = -1;
-    int currentPage = 0;         // top-most visible page
-    int formPage = -1;           // page whose form field currently has focus
+    int pendingScrollRectPage = -1;
+    PRect pendingScrollRect;
+    int currentPage = 0;         // the most visible page
+    int formPage = -1;           // page whose form field has focus
     std::vector<PageTex> cache;
+    std::vector<ThumbTex> thumbs;
+    ImVec2 canvasOrigin{ 0, 0 }, canvasSize{ 0, 0 };
+
+    // pointer
+    int hoverPage = -1;
+    float hoverPx = 0, hoverPy = 0;
 
     // new-object style
     float fillColor[4] = { 0.10f, 0.10f, 0.12f, 1.0f };
@@ -103,40 +167,63 @@ public:
     bool rectFilled = true;
     bool rectStroked = false;
     float strokeWidth = 1.5f;
-    int fontIndex = 0;           // index into FontList()
-    float fontSize = 14.0f;
-    bool matchNearbyFont = true; // new text copies the PDF's font near the click
-    // font sampled at the last Text-tool click (the PDF's own font)
+    int fontIndex = 0;
+    float fontSize = 12.0f;
+    bool matchNearbyFont = true;
+    // style sampled from the text nearest the last Text-tool click
+    FPDF_PAGEOBJECT pendingStyleObj = nullptr;
+    uint32_t pendingStyleGen = 0;
     std::vector<uint8_t> pendingFontData;
     std::string pendingFontBase;
     double pendingFontSize = 0;
+    unsigned pendingColor = 0;
     bool pendingFontValid = false;
 
     // inline text editor
     bool editing = false;
     bool editIsNew = false;
+    bool editFocus = false;
     int editPage = -1;
     FPDF_PAGEOBJECT editObj = nullptr;
-    float editAtX = 0, editAtY = 0;     // placement point for a new text obj
+    float editAtX = 0, editAtY = 0;
     std::string editBuf;
+    std::string editOriginal;
 
     // drag interaction
     bool dragging = false;
-    int dragMode = 0;            // 0 none, 1 move obj, 2 rect, 3 redact, 4 resize
+    bool dragArmed = false;      // moves start only after a small threshold
+    int dragMode = 0;            // 1 move, 2 rect, 3 redact, 4 resize, 5 marquee, 6 annot, 7 cut
     int dragPage = -1;
     ImVec2 dragStartScreen{ 0, 0 };
     float dragStartPx = 0, dragStartPy = 0;
     float dragLastPx = 0, dragLastPy = 0;
+    float grabDX = 0, grabDY = 0;           // cursor minus selection lower-left at grab
     PRect dragRect;
-    int resizeHandle = -1;       // 0..7 = TL,T,TR,R,BR,B,BL,L
-    PRect resizeStart;           // selection page bounds at grab
-    bool nudgeDirty = false;     // arrow-key edits pending a commit
+    int resizeHandle = -1;
+    PRect resizeStart;
+    bool nudgeDirty = false;
+    int ghostPage = -1;                     // cross-page drop preview
+    PRect ghostRect;
 
-    // multi-selection / grouping (all members are top-level objects on sel.page)
+    // multi-selection / grouping
     std::vector<FPDF_PAGEOBJECT> groupSel;
-    int selGroupId = 0;          // >0 if the selection is a saved group
-    bool openObjCtx = false;     // request to open the object context menu
-    PRect marquee;               // marquee rectangle (dragMode 5)
+    int selGroupId = 0;
+    bool openObjCtx = false;
+    int ctxPage = -1;
+    float ctxPx = 0, ctxPy = 0;
+    PRect marquee;
+
+    // annotation selection
+    int annSelPage = -1, annSelIdx = -1;
+
+    // clipboard
+    std::vector<ops::ClipObject> clip;
+    std::vector<FPDF_PAGEOBJECT> limbo;     // cut objects kept alive for an exact paste
+    uint32_t limboDoc = 0;
+    int clipSrcPage = -1;
+    std::string clipText;                   // what we last put on the system clipboard
+    unsigned long clipSeq = 0;              // Windows clipboard sequence number at our copy
+    int pasteCount = 0;
 
     // table / form generator
     bool showTable = false;
@@ -162,70 +249,23 @@ public:
     std::wstring pwFile;
     std::string pwInput;
     std::string pwError;
-
     bool showMeta = false;
     bool showAbout = false;
-
+    bool showHelp = false;
     bool showImport = false;
     std::wstring importFile;
     std::string importRange;
     std::string importPw;
     int importAt = -1;
-
     bool showExtract = false;
     std::string extractedText;
 
-    float exportDpi = 150.0f;
-
     Toast toast;
-
-    // helpers ----------------------------------------------------------------
-    const std::vector<FontChoice>& FontList();
-    FontChoice CurrentFont();
-    bool HasDoc() const { return const_cast<Document&>(doc).PageCount() > 0 || const_cast<Document&>(doc).Raw(); }
-    // Map a screen point to (page, pageX, pageY); returns false if not over a page.
-    bool ScreenToPage(ImVec2 screen, int& page, float& px, float& py);
-    void SelectObjectAt(int page, float px, float py);
-    // Promotes a nested selection to a top-level object so edits persist on save.
-    // Returns true if the selection is editable afterwards.
-    bool EnsureSelectionEditable();
-
-    // --- multi-selection / grouping ---
-    // Select every top-level object on the current page; linesOnly restricts to
-    // path/line objects (skips text and images) so a table frame can be grouped
-    // and resized without dragging its text along.
-    void SelectAllOnPage(bool linesOnly);
-    void GroupAllLines();                   // select all lines + group in one step
-    void RefreshGroupSel();                 // rebuild groupSel from sel (whole group if grouped)
-    PRect SelectionBounds();                // union page bounds of groupSel
-    void MoveSelection(float dxPage, float dyPage);
-    void ResizeSelectionTo(PRect target);   // scales all members about current bounds
-    void DeleteSelection();
-    void GroupSelection();                  // tag all members with one new group id
-    void UngroupSelection();                // clear the tag (or explode a Form XObject)
-    // Splits the selected multi-line path into individual lines; optionally keeps
-    // the one nearest (px,py) selected so it can be moved immediately.
-    void SplitSelectedPath(bool pickNearest, float px, float py);
-    bool SelectionIsGrouped() const { return selGroupId != 0; }
-
-    // --- clipboard / cross-page ---
-    void CopySelection();
-    void CutSelection();
-    void PasteClipboard();                  // onto the current page
-    void TransferSelectionToPage(int tp);   // move the selection to another page
-    std::vector<ops::ClipObject> clip;
-    void SelectNewObject(int pg, FPDF_PAGEOBJECT o) {
-        sel.page = pg; sel.obj = o; sel.parent = nullptr;
-        sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();
-        groupSel.assign(1, o); selGroupId = 0;
-    }
-    void CommitIfDirty(const std::string& label);
-    void ForwardFormKey(int vk, bool down);
-    void ForwardFormChar(unsigned int ch);
+    std::wstring lastTitle;
 
 private:
+    void ResetAfterLoad();
+    void UpdateTitle();
     std::vector<FontChoice> fontList_;
     bool fontListBuilt_ = false;
-    bool pendingCommit_ = false;
-    std::string pendingLabel_;
 };

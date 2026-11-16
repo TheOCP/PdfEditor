@@ -86,6 +86,9 @@ public:
     uint32_t PageVersion(int i) const { return (i >= 0 && i < PageCount()) ? slots_[i].version : 0; }
     // Bumps whenever FPDF_PAGE / FPDF_PAGEOBJECT handles became invalid.
     uint32_t Generation() const { return generation_; }
+    // Changes only when the underlying PDFium document is replaced (open, new,
+    // undo/redo); page objects removed from a page stay valid while it is equal.
+    uint32_t DocId() const { return docId_; }
     uint64_t EditCounter() const { return edits_; }
 
     // ---- rendering: BGRA of the device rect (rx,ry,rw,rh) of the page drawn at
@@ -146,6 +149,7 @@ private:
     std::map<std::string, FPDF_FONT> fonts_;
     std::map<std::wstring, Bytes> fontData_;
     uint32_t generation_ = 1;
+    uint32_t docId_ = 1;
     uint64_t edits_ = 1;
 };
 
