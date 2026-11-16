@@ -105,6 +105,12 @@ public:
     float strokeWidth = 1.5f;
     int fontIndex = 0;           // index into FontList()
     float fontSize = 14.0f;
+    bool matchNearbyFont = true; // new text copies the PDF's font near the click
+    // font sampled at the last Text-tool click (the PDF's own font)
+    std::vector<uint8_t> pendingFontData;
+    std::string pendingFontBase;
+    double pendingFontSize = 0;
+    bool pendingFontValid = false;
 
     // inline text editor
     bool editing = false;
@@ -197,7 +203,17 @@ public:
     void DeleteSelection();
     void GroupSelection();                  // tag all members with one new group id
     void UngroupSelection();                // clear the tag (or explode a Form XObject)
+    // Splits the selected multi-line path into individual lines; optionally keeps
+    // the one nearest (px,py) selected so it can be moved immediately.
+    void SplitSelectedPath(bool pickNearest, float px, float py);
     bool SelectionIsGrouped() const { return selGroupId != 0; }
+
+    // --- clipboard / cross-page ---
+    void CopySelection();
+    void CutSelection();
+    void PasteClipboard();                  // onto the current page
+    void TransferSelectionToPage(int tp);   // move the selection to another page
+    std::vector<ops::ClipObject> clip;
     void SelectNewObject(int pg, FPDF_PAGEOBJECT o) {
         sel.page = pg; sel.obj = o; sel.parent = nullptr;
         sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();

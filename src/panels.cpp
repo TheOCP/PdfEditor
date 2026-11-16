@@ -32,6 +32,9 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, doc.CanUndo())) Undo();
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, doc.CanRedo())) Redo();
         ImGui::Separator();
+        if (ImGui::MenuItem("Copy", "Ctrl+C", false, sel.Valid(doc))) CopySelection();
+        if (ImGui::MenuItem("Cut", "Ctrl+X", false, sel.Valid(doc))) CutSelection();
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !clip.empty())) PasteClipboard();
         if (ImGui::MenuItem("Delete selected", "Del", false, sel.Valid(doc))) DeleteSelection();
         ImGui::Separator();
         bool has = doc.Raw() != nullptr;
@@ -236,6 +239,10 @@ void App::DrawThumbnails() {
 void App::DrawProperties() {
     if (ImGui::CollapsingHeader("New object style", ImGuiTreeNodeFlags_DefaultOpen)) {
         const auto& fl = FontList();
+        ImGui::Checkbox("Match the PDF's font for new text", &matchNearbyFont);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("New text copies the font of the nearest existing text.\nTurn off to use the font chosen below.");
+        ImGui::BeginDisabled(matchNearbyFont);
         ImGui::TextUnformatted("Font");
         ImGui::SetNextItemWidth(-1);
         const char* cur = (fontIndex >= 0 && fontIndex < (int)fl.size()) ? fl[fontIndex].label.c_str() : "(none)";
@@ -247,6 +254,7 @@ void App::DrawProperties() {
             }
             ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
         ImGui::SetNextItemWidth(-1);
         ImGui::DragFloat("Size##new", &fontSize, 0.3f, 4.0f, 400.0f, "%.1f pt");
         ImGui::ColorEdit4("Fill", fillColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
@@ -338,12 +346,13 @@ void App::DrawProperties() {
             if (t == FPDF_PAGEOBJ_PATH) {
                 ops::StrokeProps st = ops::ReadStroke(sel.obj);
                 ImGui::Separator();
-                ImGui::TextDisabled("Line / stroke");
-                float lw = st.width;
+                ImGui::TextDisabled("Line");
+                float lw = ops::LineThickness(sel.obj);
                 ImGui::SetNextItemWidth(-1);
-                if (ImGui::DragFloat("Thickness", &lw, 0.05f, 0.1f, 40.0f, "%.2f pt")) {
+                // Universal thickness: works for horizontal AND vertical lines.
+                if (ImGui::DragFloat("Thickness", &lw, 0.05f, 0.1f, 60.0f, "%.2f pt")) {
                     EnsureSelectionEditable();
-                    ops::SetObjectStroke(doc, sel.page, sel.obj, st.r, st.g, st.b, lw);
+                    ops::SetLineThickness(doc, sel.page, sel.obj, lw);
                     InvalidatePage(sel.page);
                 }
                 if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line thickness");
@@ -398,10 +407,16 @@ static void DrawTextEditor(App& a) {
             if (a.editIsNew) {
                 if (!w.empty()) {
                     std::string err;
-                    FPDF_PAGEOBJECT o = ops::AddText(a.doc, a.editPage, w, a.CurrentFont(), a.fontSize,
-                                                     a.editAtX, a.editAtY,
-                                                     (unsigned)(a.fillColor[0] * 255), (unsigned)(a.fillColor[1] * 255),
-                                                     (unsigned)(a.fillColor[2] * 255), err);
+                    unsigned cr = (unsigned)(a.fillColor[0] * 255), cg = (unsigned)(a.fillColor[1] * 255), cb = (unsigned)(a.fillColor[2] * 255);
+                    FPDF_PAGEOBJECT o = nullptr;
+                    // Keep the PDF's own font unless the user turned matching off.
+                    if (a.matchNearbyFont && a.pendingFontValid)
+                        o = ops::AddTextEmbedded(a.doc, a.editPage, w, a.pendingFontData, a.pendingFontBase,
+                                                 a.pendingFontSize > 0 ? a.pendingFontSize : a.fontSize,
+                                                 a.editAtX, a.editAtY, cr, cg, cb, err);
+                    if (!o)
+                        o = ops::AddText(a.doc, a.editPage, w, a.CurrentFont(), a.fontSize,
+                                         a.editAtX, a.editAtY, cr, cg, cb, err);
                     if (o) {
                         a.SelectNewObject(a.editPage, o);
                         a.InvalidatePage(a.editPage); a.CommitIfDirty("Add text");

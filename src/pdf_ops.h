@@ -59,6 +59,13 @@ FPDF_PAGEOBJECT AddText(Document& d, int page, const std::wstring& text, const F
 bool RestyleText(Document& d, int page, FPDF_PAGEOBJECT obj, const FontChoice& fc, double fontSize,
                  std::string& err);
 
+// Adds text using a specific font given as raw font-program bytes (as captured
+// from an existing object), falling back to a system match of fontBase, then to
+// a standard font. Lets new text adopt the PDF's own font.
+FPDF_PAGEOBJECT AddTextEmbedded(Document& d, int page, const std::wstring& text, const Bytes& fontData,
+                                const std::string& fontBase, double size, float px, float py,
+                                unsigned r, unsigned g, unsigned b, std::string& err);
+
 // ---- geometry --------------------------------------------------------------
 
 void MoveObject(Document& d, int page, FPDF_PAGEOBJECT obj, float dxPt, float dyPt);
@@ -87,6 +94,14 @@ bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target);
 
 // Breaks a top-level Form XObject into its child objects on the page.
 bool ExplodeForm(Document& d, int page, FPDF_PAGEOBJECT form);
+
+// Number of sub-paths (MoveTo-started runs) in a path object.
+int SubpathCount(FPDF_PAGEOBJECT obj);
+// Splits a single path object that draws several lines (sub-paths) into one
+// path object per sub-path, so each line can be moved on its own. Preserves
+// matrix, colours, stroke width and any group tag. Returns the new objects
+// (empty if the path has fewer than 2 sub-paths). Top-level objects only.
+std::vector<FPDF_PAGEOBJECT> SplitPath(Document& d, int page, FPDF_PAGEOBJECT obj);
 
 // ---- images ----------------------------------------------------------------
 
@@ -121,6 +136,11 @@ struct StrokeProps { bool isPath = false; float width = 1; unsigned r = 0, g = 0
 StrokeProps ReadStroke(FPDF_PAGEOBJECT obj);
 void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width);
 
+// Orientation-agnostic line thickness (works for horizontal and vertical lines,
+// whether they are stroked hairlines or thin filled bars).
+float LineThickness(FPDF_PAGEOBJECT obj);
+void  SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick);
+
 // Applies an arbitrary affine to a top-level object (used for group move/resize).
 void TransformObjectPage(Document& d, int page, FPDF_PAGEOBJECT obj, const FS_MATRIX& m);
 
@@ -133,6 +153,36 @@ void SetGroupId(Document& d, int page, FPDF_PAGEOBJECT obj, int id);
 void ClearGroupId(Document& d, int page, FPDF_PAGEOBJECT obj);
 int  MaxGroupId(Document& d);                         // highest id in use (0 if none)
 std::vector<FPDF_PAGEOBJECT> GroupMembers(Document& d, int page, int id);
+
+// ---- clipboard (copy objects, incl. across pages) ------------------------
+// A self-contained description of one page object, enough to rebuild it on any
+// page of the same document. Text keeps its real embedded font bytes so copies
+// look identical; straight paths (table lines) copy exactly, beziers approximate.
+struct ClipObject {
+    int type = 0;
+    FS_MATRIX matrix{ 1, 0, 0, 1, 0, 0 };
+    int groupId = 0;
+    // text
+    std::wstring text;
+    double fontSize = 12;
+    std::string fontBase;
+    Bytes fontData;
+    int textRender = 0;
+    // path
+    struct Seg { int type = 0; float x = 0, y = 0; bool close = false; };
+    std::vector<Seg> segs;
+    int fillMode = 0;
+    bool stroke = false;
+    // colours (fill for text/path, stroke for path)
+    unsigned fr = 0, fg = 0, fb = 0, fa = 255, sr = 0, sg = 0, sb = 0, sa = 255;
+    float strokeW = 1;
+    // image
+    Image image;
+};
+
+bool CaptureObject(Document& d, int page, FPDF_PAGEOBJECT obj, ClipObject& out);
+FPDF_PAGEOBJECT PasteObject(Document& d, int page, const ClipObject& c, float dxPage, float dyPage,
+                            int newGroupId, std::string& err);
 
 // Removes every top-level object fully inside `box`, then paints `box` solid.
 // This actually deletes the covered content (unlike a black highlight on top).

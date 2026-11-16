@@ -184,6 +184,92 @@ bool RestyleText(Document& d, int page, FPDF_PAGEOBJECT obj, const FontChoice& f
 
 // ----------------------------------------------------------------- geometry
 
+// Best font for (embedded bytes, base name): the embedded program if present,
+// else a standard-14 font by that name (keeps text extractable), else a
+// visually matching installed font, else Helvetica.
+static FPDF_FONT LoadFontFor(Document& d, const Bytes& data, const std::string& base) {
+    if (!data.empty())
+        if (FPDF_FONT f = FPDFText_LoadFont(d.Raw(), data.data(), (uint32_t)data.size(), FPDF_FONT_TRUETYPE, 1))
+            return f;
+    static const char* kStd14[] = {
+        "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+        "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+        "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique", "Symbol", "ZapfDingbats",
+    };
+    for (const char* n : kStd14)
+        if (base == n)
+            if (FPDF_FONT f = FPDFText_LoadStandardFont(d.Raw(), base.c_str())) return f;
+    if (!base.empty()) {
+        bool ex = false;
+        if (const SysFont* sf = MatchSystemFont(base, &ex)) {
+            Bytes fd;
+            if (ReadFileBytes(sf->file, fd))
+                if (FPDF_FONT f = FPDFText_LoadFont(d.Raw(), fd.data(), (uint32_t)fd.size(), FPDF_FONT_TRUETYPE, 0))
+                    return f;
+        }
+    }
+    if (FPDF_FONT f = FPDFText_LoadStandardFont(d.Raw(), base.empty() ? "Helvetica" : base.c_str())) return f;
+    return FPDFText_LoadStandardFont(d.Raw(), "Helvetica");
+}
+
+FPDF_PAGEOBJECT AddTextEmbedded(Document& d, int page, const std::wstring& text, const Bytes& fontData,
+                                const std::string& fontBase, double size, float px, float py,
+                                unsigned r, unsigned g, unsigned b, std::string& err) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p) { err = "page not loaded"; return nullptr; }
+    FPDF_FONT font = LoadFontFor(d, fontData, fontBase);
+    if (!font) { err = "could not load a font"; return nullptr; }
+    FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(d.Raw(), font, (float)size);
+    if (!o) { err = "could not create text object"; return nullptr; }
+    if (!text.empty() && !FPDFText_SetText(o, WS(text))) {
+        FPDFPageObj_Destroy(o);
+        err = "that font lacks some of these characters";
+        return nullptr;
+    }
+    FPDFPageObj_SetFillColor(o, r, g, b, 255);
+    FPDFPageObj_Transform(o, 1, 0, 0, 1, px, py);
+    FPDFPage_InsertObject(p, o);
+    d.ContentChanged(page);
+    return o;
+}
+
+// Visible thickness of a line, orientation-agnostic: a stroked hairline reports
+// its stroke width; a filled/thick line reports its short dimension.
+float LineThickness(FPDF_PAGEOBJECT obj) {
+    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return 0;
+    int fm = 0; FPDF_BOOL st = 0;
+    FPDFPath_GetDrawMode(obj, &fm, &st);
+    PRect b = ObjectBounds(obj);
+    float shortd = std::min(b.W(), b.H());
+    if (st && shortd < 0.8f) { float sw = 1; FPDFPageObj_GetStrokeWidth(obj, &sw); return sw; }
+    return shortd;
+}
+
+// Make a line thicker/thinner no matter its direction. A stroked hairline grows
+// via stroke width; any line with real area grows along its short axis, about
+// its centre (so it fattens symmetrically without moving).
+void SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick) {
+    if (!obj || thick <= 0 || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return;
+    int fm = 0; FPDF_BOOL st = 0;
+    FPDFPath_GetDrawMode(obj, &fm, &st);
+    PRect b = ObjectBounds(obj);
+    float w = b.W(), h = b.H();
+    float shortd = std::min(w, h);
+    if (st && shortd < 0.8f) {           // a stroked hairline: stroke width is the only thickness
+        FPDFPageObj_SetStrokeWidth(obj, thick);
+        d.ContentChanged(page);
+        return;
+    }
+    if (w <= h) {                        // vertical-ish: short axis is width -> scale X about centre
+        float cx = (b.l + b.r) * 0.5f, cur = std::max(w, 0.01f), sx = thick / cur;
+        FPDFPageObj_Transform(obj, sx, 0, 0, 1, cx - sx * cx, 0);
+    } else {                             // horizontal-ish: short axis is height -> scale Y about centre
+        float cy = (b.b + b.t) * 0.5f, cur = std::max(h, 0.01f), sy = thick / cur;
+        FPDFPageObj_Transform(obj, 1, 0, 0, sy, 0, cy - sy * cy);
+    }
+    d.ContentChanged(page);
+}
+
 void MoveObject(Document& d, int page, FPDF_PAGEOBJECT obj, float dx, float dy) {
     if (!obj || (dx == 0 && dy == 0)) return;
     FPDFPageObj_Transform(obj, 1, 0, 0, 1, dx, dy);
@@ -291,12 +377,206 @@ bool PromoteObject(Document& d, int page, FPDF_PAGEOBJECT target) {
     return true;   // not nested under any top-level form
 }
 
+// ---- clipboard capture / paste --------------------------------------------
+
+bool CaptureObject(Document& d, int page, FPDF_PAGEOBJECT obj, ClipObject& out) {
+    if (!obj) return false;
+    out = ClipObject{};
+    out.type = FPDFPageObj_GetType(obj);
+    FPDFPageObj_GetMatrix(obj, &out.matrix);
+    out.groupId = GetGroupId(obj);
+    unsigned r = 0, g = 0, b = 0, a = 255;
+    if (FPDFPageObj_GetFillColor(obj, &r, &g, &b, &a)) { out.fr = r; out.fg = g; out.fb = b; out.fa = a; }
+    if (FPDFPageObj_GetStrokeColor(obj, &r, &g, &b, &a)) { out.sr = r; out.sg = g; out.sb = b; out.sa = a; }
+    FPDFPageObj_GetStrokeWidth(obj, &out.strokeW);
+
+    if (out.type == FPDF_PAGEOBJ_TEXT) {
+        float sz = 12;
+        FPDFTextObj_GetFontSize(obj, &sz);
+        out.fontSize = sz;
+        FPDF_TEXTPAGE tp = d.TextPage(page);
+        unsigned long bytes = FPDFTextObj_GetText(obj, tp, nullptr, 0);
+        if (bytes >= 2) {
+            std::vector<unsigned short> buf(bytes / 2 + 1, 0);
+            FPDFTextObj_GetText(obj, tp, buf.data(), bytes);
+            out.text = reinterpret_cast<wchar_t*>(buf.data());
+        }
+        out.textRender = FPDFTextObj_GetTextRenderMode(obj);
+        if (FPDF_FONT f = FPDFTextObj_GetFont(obj)) {
+            char nm[256] = { 0 };
+            if (FPDFFont_GetBaseFontName(f, nm, sizeof(nm))) out.fontBase = nm;
+            // Only keep the font program for fonts that are actually embedded; for
+            // the standard-14 / substituted fonts PDFium hands back a substitute
+            // program, and re-embedding that breaks text extraction on paste.
+            if (FPDFFont_GetIsEmbedded(f) == 1) {
+                size_t need = 0;
+                if (FPDFFont_GetFontData(f, nullptr, 0, &need) && need > 0 && need < (size_t)50 * 1024 * 1024) {
+                    out.fontData.resize(need);
+                    size_t got = 0;
+                    if (FPDFFont_GetFontData(f, out.fontData.data(), need, &got)) out.fontData.resize(got);
+                    else out.fontData.clear();
+                }
+            }
+        }
+        return true;
+    }
+    if (out.type == FPDF_PAGEOBJ_PATH) {
+        int fm = 0; FPDF_BOOL st = 0;
+        FPDFPath_GetDrawMode(obj, &fm, &st);
+        out.fillMode = fm; out.stroke = st != 0;
+        int ns = FPDFPath_CountSegments(obj);
+        for (int i = 0; i < ns; ++i) {
+            FPDF_PATHSEGMENT s = FPDFPath_GetPathSegment(obj, i);
+            if (!s) continue;
+            ClipObject::Seg seg;
+            seg.type = FPDFPathSegment_GetType(s);
+            FPDFPathSegment_GetPoint(s, &seg.x, &seg.y);
+            seg.close = FPDFPathSegment_GetClose(s) != 0;
+            out.segs.push_back(seg);
+        }
+        return !out.segs.empty();
+    }
+    if (out.type == FPDF_PAGEOBJ_IMAGE) {
+        FPDF_BITMAP bm = FPDFImageObj_GetRenderedBitmap(d.Raw(), d.Page(page), obj);
+        if (!bm) return false;
+        int w = FPDFBitmap_GetWidth(bm), h = FPDFBitmap_GetHeight(bm);
+        int stride = FPDFBitmap_GetStride(bm);
+        void* buf = FPDFBitmap_GetBuffer(bm);
+        if (w > 0 && h > 0 && buf) {
+            out.image.w = w; out.image.h = h;
+            out.image.px.assign((size_t)w * h, 0);
+            const uint8_t* src = static_cast<const uint8_t*>(buf);
+            for (int y = 0; y < h; ++y)
+                memcpy(&out.image.px[(size_t)y * w], src + (size_t)y * stride, (size_t)w * 4);
+        }
+        FPDFBitmap_Destroy(bm);
+        return out.image.w > 0;
+    }
+    return false;   // forms are promoted/exploded before copying
+}
+
+FPDF_PAGEOBJECT PasteObject(Document& d, int page, const ClipObject& c, float dx, float dy,
+                            int newGroupId, std::string& err) {
+    FPDF_PAGE p = d.Page(page);
+    if (!p) { err = "page not loaded"; return nullptr; }
+    FS_MATRIX m = c.matrix;
+    m.e += dx; m.f += dy;
+    FPDF_PAGEOBJECT o = nullptr;
+
+    if (c.type == FPDF_PAGEOBJ_TEXT) {
+        FPDF_FONT font = LoadFontFor(d, c.fontData, c.fontBase);
+        if (!font) { err = "could not load a font for the pasted text"; return nullptr; }
+        o = FPDFPageObj_CreateTextObj(d.Raw(), font, (float)c.fontSize);
+        if (o && !c.text.empty()) FPDFText_SetText(o, WS(c.text));
+        if (o) {
+            FPDFPageObj_SetFillColor(o, c.fr, c.fg, c.fb, c.fa ? c.fa : 255);
+            FPDFTextObj_SetTextRenderMode(o, (FPDF_TEXT_RENDERMODE)c.textRender);
+        }
+    } else if (c.type == FPDF_PAGEOBJ_PATH) {
+        if (c.segs.empty()) { err = "empty path"; return nullptr; }
+        o = FPDFPageObj_CreateNewPath(c.segs[0].x, c.segs[0].y);
+        if (o && c.segs[0].close) FPDFPath_Close(o);
+        for (size_t i = 1; o && i < c.segs.size(); ++i) {
+            const auto& s = c.segs[i];
+            if (s.type == FPDF_SEGMENT_MOVETO) FPDFPath_MoveTo(o, s.x, s.y);
+            else FPDFPath_LineTo(o, s.x, s.y);     // bezier control points aren't exposed: approximate with a line
+            if (s.close) FPDFPath_Close(o);
+        }
+        if (o) {
+            FPDFPath_SetDrawMode(o, c.fillMode, c.stroke ? 1 : 0);
+            if (c.fillMode) FPDFPageObj_SetFillColor(o, c.fr, c.fg, c.fb, c.fa ? c.fa : 255);
+            if (c.stroke) {
+                FPDFPageObj_SetStrokeColor(o, c.sr, c.sg, c.sb, c.sa ? c.sa : 255);
+                FPDFPageObj_SetStrokeWidth(o, c.strokeW > 0 ? c.strokeW : 1);
+            }
+        }
+    } else if (c.type == FPDF_PAGEOBJ_IMAGE) {
+        if (c.image.w <= 0) { err = "empty image"; return nullptr; }
+        o = FPDFPageObj_NewImageObj(d.Raw());
+        FPDF_BITMAP bmp = FPDFBitmap_CreateEx(c.image.w, c.image.h, FPDFBitmap_BGRA,
+                                              const_cast<uint32_t*>(c.image.px.data()), c.image.w * 4);
+        if (o && bmp) FPDFImageObj_SetBitmap(nullptr, 0, o, bmp);
+        if (bmp) FPDFBitmap_Destroy(bmp);
+    }
+    if (!o) { err = "could not recreate the object"; return nullptr; }
+    FPDFPageObj_SetMatrix(o, &m);
+    if (newGroupId) SetGroupId(d, page, o, newGroupId);
+    FPDFPage_InsertObject(p, o);
+    FPDFPage_GenerateContent(p);
+    d.ContentChanged(page);
+    return o;
+}
+
 bool ExplodeForm(Document& d, int page, FPDF_PAGEOBJECT form) {
     FPDF_PAGE p = d.Page(page);
     if (!p || !form || FPDFPageObj_GetType(form) != FPDF_PAGEOBJ_FORM) return false;
     ExplodeFormToPage(p, form);
     d.ContentChanged(page);
     return true;
+}
+
+int SubpathCount(FPDF_PAGEOBJECT obj) {
+    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return 0;
+    int n = FPDFPath_CountSegments(obj), subs = 0;
+    for (int i = 0; i < n; ++i) {
+        FPDF_PATHSEGMENT s = FPDFPath_GetPathSegment(obj, i);
+        if (s && (FPDFPathSegment_GetType(s) == FPDF_SEGMENT_MOVETO || i == 0)) ++subs;
+    }
+    return subs;
+}
+
+std::vector<FPDF_PAGEOBJECT> SplitPath(Document& d, int page, FPDF_PAGEOBJECT obj) {
+    std::vector<FPDF_PAGEOBJECT> out;
+    FPDF_PAGE p = d.Page(page);
+    if (!p || !obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return out;
+
+    FS_MATRIX m{ 1, 0, 0, 1, 0, 0 };
+    FPDFPageObj_GetMatrix(obj, &m);
+    int fm = 0; FPDF_BOOL st = 0;
+    FPDFPath_GetDrawMode(obj, &fm, &st);
+    unsigned fr = 0, fg = 0, fb = 0, fa = 255, sr = 0, sg = 0, sb = 0, sa = 255;
+    FPDFPageObj_GetFillColor(obj, &fr, &fg, &fb, &fa);
+    FPDFPageObj_GetStrokeColor(obj, &sr, &sg, &sb, &sa);
+    float sw = 1; FPDFPageObj_GetStrokeWidth(obj, &sw);
+    int gid = GetGroupId(obj);
+
+    struct Seg { int t; float x, y; bool c; };
+    std::vector<std::vector<Seg>> subs;
+    int n = FPDFPath_CountSegments(obj);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PATHSEGMENT s = FPDFPath_GetPathSegment(obj, i);
+        if (!s) continue;
+        Seg sg2; sg2.t = FPDFPathSegment_GetType(s);
+        FPDFPathSegment_GetPoint(s, &sg2.x, &sg2.y);
+        sg2.c = FPDFPathSegment_GetClose(s) != 0;
+        if (sg2.t == FPDF_SEGMENT_MOVETO || subs.empty()) subs.push_back({});
+        subs.back().push_back(sg2);
+    }
+    if (subs.size() < 2) return out;   // nothing to split
+
+    for (auto& sp : subs) {
+        if (sp.empty()) continue;
+        FPDF_PAGEOBJECT o = FPDFPageObj_CreateNewPath(sp[0].x, sp[0].y);
+        if (!o) continue;
+        if (sp[0].c) FPDFPath_Close(o);
+        for (size_t i = 1; i < sp.size(); ++i) {
+            if (sp[i].t == FPDF_SEGMENT_MOVETO) FPDFPath_MoveTo(o, sp[i].x, sp[i].y);
+            else FPDFPath_LineTo(o, sp[i].x, sp[i].y);
+            if (sp[i].c) FPDFPath_Close(o);
+        }
+        FPDFPath_SetDrawMode(o, fm, st ? 1 : 0);
+        if (fm) FPDFPageObj_SetFillColor(o, fr, fg, fb, fa);
+        if (st) { FPDFPageObj_SetStrokeColor(o, sr, sg, sb, sa); FPDFPageObj_SetStrokeWidth(o, sw); }
+        FPDFPageObj_SetMatrix(o, &m);
+        if (gid) SetGroupId(d, page, o, gid);
+        FPDFPage_InsertObject(p, o);
+        out.push_back(o);
+    }
+    FPDFPage_RemoveObject(p, obj);
+    FPDFPageObj_Destroy(obj);
+    FPDFPage_GenerateContent(p);
+    d.ContentChanged(page);
+    return out;
 }
 
 // ------------------------------------------------------------------- images

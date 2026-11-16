@@ -246,5 +246,10 @@ void App::Draw() {
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) Undo();
         if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
         if (ImGui::IsKeyPressed(ImGuiKey_F)) focusSearch = true;
+        if (!io.WantTextInput) {
+            if (ImGui::IsKeyPressed(ImGuiKey_C)) CopySelection();
+            if (ImGui::IsKeyPressed(ImGuiKey_X)) CutSelection();
+            if (ImGui::IsKeyPressed(ImGuiKey_V)) PasteClipboard();
+        }
     }
 }

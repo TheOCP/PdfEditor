@@ -70,6 +70,83 @@ bool App::EnsureSelectionEditable() {
 
 // ------------------------------------------------------- multi-select / groups
 
+// ------------------------------------------------------- clipboard / cross-page
+
+static std::vector<FPDF_PAGEOBJECT> SelMembers(App& a) {
+    if (!a.groupSel.empty()) return a.groupSel;
+    if (a.sel.obj) return { a.sel.obj };
+    return {};
+}
+
+void App::CopySelection() {
+    if (!sel.Valid(doc)) return;
+    if (groupSel.size() <= 1 && sel.parent) EnsureSelectionEditable();   // bring a nested object to the page first
+    clip.clear();
+    for (auto o : SelMembers(*this)) {
+        ops::ClipObject c;
+        if (ops::CaptureObject(doc, sel.page, o, c)) clip.push_back(c);
+    }
+    if (clip.empty()) Toasts("Nothing copyable in the selection", true);
+    else Toasts(Fmt("Copied %d object(s)", (int)clip.size()));
+}
+
+void App::CutSelection() {
+    if (!sel.Valid(doc)) return;
+    CopySelection();
+    if (!clip.empty()) DeleteSelection();
+}
+
+void App::PasteClipboard() {
+    if (clip.empty() || doc.PageCount() == 0) return;
+    int tp = currentPage;
+    bool allGrouped = clip.size() > 1;
+    int g0 = clip.empty() ? 0 : clip[0].groupId;
+    for (auto& c : clip) if (c.groupId == 0 || c.groupId != g0) allGrouped = false;
+    int gid = allGrouped ? ops::MaxGroupId(doc) + 1 : 0;
+    std::vector<FPDF_PAGEOBJECT> pasted;
+    std::string err;
+    for (auto& c : clip) {
+        FPDF_PAGEOBJECT o = ops::PasteObject(doc, tp, c, 12.0f, -12.0f, gid, err);
+        if (o) pasted.push_back(o);
+    }
+    if (pasted.empty()) { Toasts("Paste failed: " + err, true); return; }
+    sel.page = tp; sel.obj = pasted[0]; sel.parent = nullptr;
+    sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();
+    groupSel = pasted; selGroupId = gid;
+    CommitIfDirty("Paste");
+    ScrollToPage(tp);
+    Toasts(Fmt("Pasted %d object(s) onto page %d", (int)pasted.size(), tp + 1));
+}
+
+void App::TransferSelectionToPage(int tp) {
+    if (!sel.Valid(doc) || tp < 0 || tp >= doc.PageCount() || tp == sel.page) return;
+    int src = sel.page;
+    std::vector<ops::ClipObject> tmp;
+    auto members = SelMembers(*this);
+    for (auto o : members) {
+        ops::ClipObject c;
+        if (ops::CaptureObject(doc, src, o, c)) tmp.push_back(c);
+    }
+    if (tmp.empty()) return;
+    for (auto o : members) ops::DeleteObjectNested(doc, src, o, nullptr);
+    bool keepGroup = selGroupId != 0;
+    int gid = keepGroup ? ops::MaxGroupId(doc) + 1 : 0;
+    std::vector<FPDF_PAGEOBJECT> pasted;
+    std::string err;
+    for (auto& c : tmp) {
+        FPDF_PAGEOBJECT o = ops::PasteObject(doc, tp, c, 0, 0, gid, err);
+        if (o) pasted.push_back(o);
+    }
+    sel.Clear(); groupSel = pasted; selGroupId = gid;
+    if (!pasted.empty()) {
+        sel.page = tp; sel.obj = pasted[0]; sel.parent = nullptr;
+        sel.accum = FS_MATRIX{ 1, 0, 0, 1, 0, 0 }; sel.gen = doc.Generation();
+    }
+    CommitIfDirty("Move to page");
+    ScrollToPage(tp);
+    Toasts(Fmt("Moved %d object(s) to page %d", (int)pasted.size(), tp + 1));
+}
+
 void App::SelectAllOnPage(bool linesOnly) {
     if (doc.PageCount() == 0) return;
     int pg = currentPage;
@@ -164,6 +241,33 @@ void App::GroupSelection() {
     int n = (int)groupSel.size();
     CommitIfDirty("Group objects");
     Toasts(Fmt("Grouped %d objects - they now move as one", n));
+}
+
+void App::SplitSelectedPath(bool pickNearest, float px, float py) {
+    if (!sel.Valid(doc) || ops::ObjectType(sel.obj) != FPDF_PAGEOBJ_PATH) return;
+    EnsureSelectionEditable();                       // bring it onto the page if nested
+    if (ops::SubpathCount(sel.obj) < 2) { Toasts("This is already a single line"); return; }
+    int pg = sel.page;
+    auto parts = ops::SplitPath(doc, pg, sel.obj);
+    if (parts.empty()) return;
+    auto selectOne = [&](FPDF_PAGEOBJECT o) {
+        ops::ObjInfo oi; oi.obj = o; oi.parent = nullptr; oi.bounds = ops::ObjectBounds(o);
+        sel.Set(doc, pg, oi); groupSel = { o }; selGroupId = 0;
+    };
+    if (pickNearest) {
+        FPDF_PAGEOBJECT best = parts[0]; float bd = 1e30f;
+        for (auto o : parts) {
+            PRect b = ops::ObjectBounds(o);
+            float cx = (b.l + b.r) * 0.5f, cy = (b.b + b.t) * 0.5f;
+            float dd = b.Contains(px, py) ? 0.0f : (cx - px) * (cx - px) + (cy - py) * (cy - py);
+            if (dd < bd) { bd = dd; best = o; }
+        }
+        selectOne(best);
+    } else {
+        groupSel = parts; selGroupId = 0; selectOne(parts[0]); groupSel = parts;
+    }
+    CommitIfDirty("Split into lines");
+    Toasts(Fmt("Split into %d separate lines - now move any of them", (int)parts.size()));
 }
 
 void App::UngroupSelection() {
@@ -552,11 +656,30 @@ void App::HandleCanvasInput(bool hovered) {
                 }
                 break;
             }
-            case Tool::Text:
+            case Tool::Text: {
                 editing = true; editIsNew = true; editPage = page;
                 editAtX = px; editAtY = py; editBuf.clear();
                 editObj = nullptr;
+                // Sample the PDF's own font nearest the click so new text can match it.
+                pendingFontValid = false;
+                FPDF_PAGEOBJECT nearest = nullptr; float bestd = 1e30f;
+                for (auto& o : ops::ListObjects(doc, page)) {
+                    if (o.type != FPDF_PAGEOBJ_TEXT) continue;
+                    float cx = (o.bounds.l + o.bounds.r) * 0.5f, cy = (o.bounds.b + o.bounds.t) * 0.5f;
+                    float dd = o.bounds.Contains(px, py) ? 0.0f : (cx - px) * (cx - px) + (cy - py) * (cy - py);
+                    if (dd < bestd) { bestd = dd; nearest = o.obj; }
+                }
+                if (nearest) {
+                    ops::ClipObject c;
+                    if (ops::CaptureObject(doc, page, nearest, c) && c.type == FPDF_PAGEOBJ_TEXT) {
+                        pendingFontData = c.fontData;
+                        pendingFontBase = c.fontBase;
+                        pendingFontSize = c.fontSize;
+                        pendingFontValid = true;
+                    }
+                }
                 break;
+            }
             case Tool::Image: {
                 std::wstring f;
                 if (OpenFileDialog(hwnd_, { { L"Images", L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp" }, { L"All files", L"*.*" } }, f)) {
@@ -625,7 +748,12 @@ void App::HandleCanvasInput(bool hovered) {
     // ---- mouse up ----
     if (dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         if (dragMode == 1) {
-            if (sel.Valid(doc)) CommitIfDirty(groupSel.size() > 1 ? "Move group" : "Move object");
+            // Dropped over a different page? Move the selection onto that page.
+            int dp; float dpx, dpy;
+            if (ScreenToPage(mouse, dp, dpx, dpy) && dp != dragPage)
+                TransferSelectionToPage(dp);
+            else if (sel.Valid(doc))
+                CommitIfDirty(groupSel.size() > 1 ? "Move group" : "Move object");
         } else if (dragMode == 4) {
             if (sel.Valid(doc)) CommitIfDirty("Resize");
             resizeHandle = -1;
@@ -669,13 +797,15 @@ void App::HandleCanvasInput(bool hovered) {
             editing = true; editIsNew = false; editPage = page; editObj = sel.obj;
             editBuf = W2U(tp.text);
         } else if (hit) {
-            // Select just this one line/member (it keeps its group tag, so the group
-            // stays intact) - now you can nudge it alone to change the spacing.
             sel.Set(doc, page, *hit);
             groupSel = { sel.obj };
             selGroupId = 0;
-            if (ops::GetGroupId(sel.obj))
+            // A path that draws several lines at once -> split so one line can move alone.
+            if (hit->type == FPDF_PAGEOBJ_PATH && ops::SubpathCount(hit->obj) > 1) {
+                SplitSelectedPath(true, px, py);
+            } else if (ops::GetGroupId(sel.obj)) {
                 Toasts("Editing one line - drag it or use arrow keys; it stays in the group");
+            }
         }
     }
 
@@ -699,8 +829,26 @@ void App::HandleCanvasInput(bool hovered) {
         }
         if (isForm)
             if (ImGui::MenuItem("Break apart (ungroup)")) UngroupSelection();
-        if (multi || grouped || isForm) ImGui::Separator();
-        if (ImGui::MenuItem("Delete")) DeleteSelection();
+        bool splittable = sel.Valid(doc) && ops::ObjectType(sel.obj) == FPDF_PAGEOBJ_PATH &&
+                          ops::SubpathCount(sel.obj) > 1;
+        if (splittable)
+            if (ImGui::MenuItem(Fmt("Split into %d separate lines", ops::SubpathCount(sel.obj)).c_str()))
+                SplitSelectedPath(false, 0, 0);
+        if (multi || grouped || isForm || splittable) ImGui::Separator();
+        if (ImGui::MenuItem("Copy", "Ctrl+C")) CopySelection();
+        if (ImGui::MenuItem("Cut", "Ctrl+X")) CutSelection();
+        if (ImGui::MenuItem("Paste here", "Ctrl+V", false, !clip.empty())) PasteClipboard();
+        if (doc.PageCount() > 1) {
+            if (ImGui::BeginMenu("Move to page")) {
+                for (int i = 0; i < doc.PageCount(); ++i) {
+                    if (i == sel.page) continue;
+                    if (ImGui::MenuItem(Fmt("Page %d", i + 1).c_str())) { TransferSelectionToPage(i); break; }
+                }
+                ImGui::EndMenu();
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete", "Del")) DeleteSelection();
         ImGui::EndPopup();
     }
 }

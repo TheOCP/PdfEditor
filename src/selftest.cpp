@@ -112,6 +112,83 @@ int RunSelfTest() {
         Check(grew, "resize persisted through save + reload");
     }
 
+    // ---- line thickness works in any orientation ----
+    Out("\nLine thickness (any orientation):\n");
+    {
+        Document d2;
+        d2.CreateBlank(400, 400);
+        FPDF_PAGEOBJECT hz = ops::AddLine(d2, 0, 50, 200, 350, 200, 0, 0, 0, 1.0f);   // horizontal hairline
+        FPDF_PAGEOBJECT vt = ops::AddLine(d2, 0, 200, 50, 200, 350, 0, 0, 0, 1.0f);   // vertical hairline
+        ops::SetLineThickness(d2, 0, hz, 6.0f);
+        ops::SetLineThickness(d2, 0, vt, 6.0f);
+        Check(std::fabs(ops::LineThickness(hz) - 6.0f) < 0.5f, "horizontal line thickened");
+        Check(std::fabs(ops::LineThickness(vt) - 6.0f) < 0.5f, "vertical line thickened");
+        FPDF_PAGEOBJECT bar = ops::AddRect(d2, 0, { 50, 100, 350, 103 }, true, 0, 0, 0, false, 0, 0, 0, 1);  // filled 3pt bar
+        ops::SetLineThickness(d2, 0, bar, 10.0f);
+        Check(std::fabs(ops::LineThickness(bar) - 10.0f) < 0.6f, "filled horizontal bar thickened by geometry");
+    }
+
+    // ---- split one multi-line path into movable lines ----
+    Out("\nSplit a shared path into separate lines:\n");
+    {
+        Document s;
+        s.CreateBlank(400, 400);
+        FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(50, 100);
+        FPDFPath_LineTo(path, 350, 100);
+        FPDFPath_MoveTo(path, 50, 200);
+        FPDFPath_LineTo(path, 350, 200);
+        FPDFPath_MoveTo(path, 50, 300);
+        FPDFPath_LineTo(path, 350, 300);
+        FPDFPath_SetDrawMode(path, FPDF_FILLMODE_NONE, 1);
+        FPDFPageObj_SetStrokeColor(path, 0, 0, 0, 255);
+        FPDFPageObj_SetStrokeWidth(path, 1);
+        FPDFPage_InsertObject(s.Page(0), path);
+        s.ContentChanged(0);
+        Check(ops::SubpathCount(path) == 3, "one path holds 3 sub-lines");
+        auto parts = ops::SplitPath(s, 0, path);
+        Check(parts.size() == 3, "split into 3 separate line objects");
+        int paths = 0;
+        for (auto& o : ops::ListObjects(s, 0)) if (o.type == FPDF_PAGEOBJ_PATH) ++paths;
+        Check(paths == 3, "page now has 3 independent lines");
+        PRect b0 = ops::ObjectBounds(parts[0]);
+        FS_MATRIX idm{ 1, 0, 0, 1, 0, 0 };
+        ops::TranslateObjectPage(s, 0, parts[0], idm, 0, -15);
+        Check(std::fabs(ops::ObjectBounds(parts[0]).b - (b0.b - 15)) < 0.5f, "one split line moves on its own");
+    }
+
+    // ---- clipboard copy across pages ----
+    Out("\nCopy objects across pages:\n");
+    {
+        Document d3;
+        d3.CreateBlank(612, 792);
+        ops::InsertBlankPage(d3, 1, 612, 792);               // page 2
+        FontChoice fc; fc.stdName = "Helvetica";
+        std::string e;
+        ops::AddText(d3, 0, L"copy me", fc, 20, 72, 700, 10, 20, 30, e);
+        ops::AddLine(d3, 0, 72, 680, 400, 680, 0, 0, 0, 2.0f);
+        d3.Commit("setup");
+        // capture everything on page 0, paste onto page 1
+        int pasted = 0; std::string err;
+        for (auto& o : ops::ListObjects(d3, 0)) {
+            ops::ClipObject c;
+            if (ops::CaptureObject(d3, 0, o.obj, c))
+                if (ops::PasteObject(d3, 1, c, 0, 0, 0, err)) ++pasted;
+        }
+        Check(pasted == 2, "captured + pasted both objects onto page 2");
+        d3.Commit("paste");
+        Bytes cb; d3.SaveBytes(cb, 0);
+        Document cr; std::string ce;
+        Check(cr.LoadBytes(std::make_shared<Bytes>(cb), "", ce) == Document::Load::Ok, "reload after cross-page paste");
+        int txt = 0, path = 0;
+        for (auto& o : ops::ListObjects(cr, 1)) {
+            if (o.type == FPDF_PAGEOBJ_TEXT) ++txt;
+            if (o.type == FPDF_PAGEOBJ_PATH) ++path;
+        }
+        Check(txt >= 1 && path >= 1, "pasted text + line present on page 2 after reload");
+        std::wstring t2 = ops::ExtractText(cr, 1);
+        Check(t2.find(L"copy me") != std::wstring::npos, "pasted text keeps its content");
+    }
+
     // ---- group resize keeps the grid aligned ----
     Out("\nGroup resize stays perfect:\n");
     {
