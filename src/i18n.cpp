@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -435,6 +436,11 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "(%d lines)", "(%d Linien)" },
     { "Thinner", "Dünner" },
     { "Thicker", "Dicker" },
+    { "Show alignment lines when moving", "Ausrichtungslinien beim Verschieben zeigen" },
+    { "Snap into line with other text", "An anderem Text ausrichten (einrasten)" },
+    { "Hold Alt while dragging to place freely", "Beim Ziehen Alt halten, um frei zu platzieren" },
+    { "Keep line spacing when resizing", "Linienabstände beim Größe ändern beibehalten" },
+    { "Only the outer row / column changes size", "Nur die äußere Zeile / Spalte ändert ihre Größe" },
 
     // ---- error messages from the editing layer
     { "PDFium could not load this font", "PDFium konnte diese Schrift nicht laden" },
@@ -568,6 +574,21 @@ const char* K(const char* shortcut) {
     return cache.emplace(shortcut, s).first->second.c_str();
 }
 
+static std::map<std::string, bool>& Flags() {
+    static std::map<std::string, bool> m;
+    return m;
+}
+
+bool SettingFlag(const char* key, bool def) {
+    auto it = Flags().find(key);
+    return it == Flags().end() ? def : it->second;
+}
+
+void SetSettingFlag(const char* key, bool on) {
+    Flags()[key] = on;
+    SaveSettings();
+}
+
 void LoadSettings() {
     bool found = false;
     if (FILE* f = _wfopen(SettingsPath().c_str(), L"rb")) {
@@ -581,6 +602,9 @@ void LoadSettings() {
             } else if (l.rfind("uiscale=", 0) == 0) {
                 g_uiScale = (float)atof(l.c_str() + 8);
                 if (g_uiScale < 0.5f || g_uiScale > 3.0f) g_uiScale = 0.0f;
+            } else if (size_t eq = l.find('='); eq != std::string::npos && eq > 0) {
+                std::string v = l.substr(eq + 1);
+                if (v == "0" || v == "1") Flags()[l.substr(0, eq)] = v == "1";
             }
         }
         fclose(f);
@@ -594,6 +618,7 @@ void SaveSettings() {
     if (FILE* f = _wfopen(SettingsPath().c_str(), L"wb")) {
         fprintf(f, "language=%s\r\n", g_lang == Lang::German ? "de" : "en");
         fprintf(f, "uiscale=%.2f\r\n", g_uiScale);
+        for (const auto& [k, v] : Flags()) fprintf(f, "%s=%d\r\n", k.c_str(), v ? 1 : 0);
         fclose(f);
     }
 }

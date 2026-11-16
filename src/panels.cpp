@@ -419,13 +419,15 @@ void App::DrawThumbnails() {
 // "Line thickness" for the selected lines - one line, several, or a whole
 // table grid at once: a slider plus an exact number with - / + steps.
 static void DrawLineThickness(App& a) {
+    // Lines however they are drawn: stroked, thin filled rectangles, a grid of
+    // rectangles in one shape, or thin pictures.
     std::vector<FPDF_PAGEOBJECT> lines;
     bool single = a.groupSel.size() <= 1;
     if (single) {
-        if (ops::ObjectType(a.sel.obj) == FPDF_PAGEOBJ_PATH) lines.push_back(a.sel.obj);
+        if (ops::IsLine(a.sel.obj)) lines.push_back(a.sel.obj);
     } else {
         for (auto o : a.groupSel)
-            if (ops::ObjectType(o) == FPDF_PAGEOBJ_PATH) lines.push_back(o);
+            if (ops::IsLine(o)) lines.push_back(o);
     }
     if (lines.empty()) return;
     float scale = single ? ops::MatrixScale(a.sel.accum) : 1.0f;
@@ -433,9 +435,18 @@ static void DrawLineThickness(App& a) {
     for (auto o : lines) cur = std::max(cur, ops::LineThickness(o) * scale);
     auto apply = [&](float v) {
         v = std::clamp(v, 0.05f, 100.0f);
-        if (single) a.EnsureSelectionEditable();
-        std::vector<FPDF_PAGEOBJECT> targets = single ? std::vector<FPDF_PAGEOBJECT>{ a.sel.obj } : lines;
-        for (auto o : targets) ops::SetLineThickness(a.doc, a.sel.page, o, v / (single ? ops::MatrixScale(a.sel.accum) : 1.0f));
+        if (single) {
+            a.EnsureSelectionEditable();
+            float sc = ops::MatrixScale(a.sel.accum);
+            FPDF_PAGEOBJECT o = ops::SetLineThickness(a.doc, a.sel.page, a.sel.obj, v / (sc > 0 ? sc : 1.0f));
+            if (o != a.sel.obj) a.SelectNewObject(a.sel.page, o);      // the line was rebuilt
+        } else {
+            for (auto& g : a.groupSel) {
+                if (!ops::IsLine(g)) continue;
+                FPDF_PAGEOBJECT o = ops::SetLineThickness(a.doc, a.sel.page, g, v);
+                if (o != g) { if (a.sel.obj == g) a.sel.obj = o; g = o; }
+            }
+        }
         a.InvalidatePage(a.sel.page);
     };
 
@@ -463,6 +474,29 @@ static void DrawLineThickness(App& a) {
     ImGui::SameLine(0, sp);
     if (ImGui::Button("+##thicker", ImVec2(bw, 0))) { apply(cur + step); a.CommitIfDirty("Line thickness"); }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Thicker"));
+}
+
+// Alignment while moving text (remembered).
+static void DrawAlignOptions() {
+    bool g = SettingFlag("alignguides", true), s = SettingFlag("alignsnap", true);
+    if (CheckboxWrap(T("Show alignment lines when moving"), &g)) SetSettingFlag("alignguides", g);
+    if (CheckboxWrap(T("Snap into line with other text"), &s)) SetSettingFlag("alignsnap", s);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Hold Alt while dragging to place freely"));
+}
+
+// Line colour for every selected line.
+static void DrawGroupLineColour(App& a) {
+    FPDF_PAGEOBJECT first = nullptr;
+    for (auto o : a.groupSel) if (ops::IsLine(o) && ops::ObjectType(o) == FPDF_PAGEOBJ_PATH) { first = o; break; }
+    unsigned r = 0, g = 0, b = 0;
+    if (!first || !ops::LineColor(first, r, g, b)) return;
+    float lc[3] = { r / 255.0f, g / 255.0f, b / 255.0f };
+    if (ImGui::ColorEdit3(T("Line colour##glc"), lc, ImGuiColorEditFlags_NoInputs)) {
+        for (auto o : a.groupSel)
+            if (ops::IsLine(o)) ops::SetLineColor(a.doc, a.sel.page, o, (unsigned)(lc[0] * 255), (unsigned)(lc[1] * 255), (unsigned)(lc[2] * 255));
+        a.InvalidatePage(a.sel.page);
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) a.CommitIfDirty("Line colour");
 }
 
 // ---------------------------------------------------------------- properties
@@ -493,6 +527,21 @@ void App::DrawProperties() {
             if (xe || ye) { MoveSelection(left - b.l, bottom - b.b); CommitIfDirty("Move group"); }
             ImGui::TextWrapped(T("Size: %.1f x %.1f pt"), b.W(), b.H());
             DrawLineThickness(*this);
+            bool anyLine = false, anyText = false;
+            for (auto o : groupSel) {
+                anyLine |= ops::IsLine(o);
+                anyText |= ops::ObjectType(o) == FPDF_PAGEOBJ_TEXT;
+            }
+            if (anyLine) {
+                DrawGroupLineColour(*this);
+                bool keep = SettingFlag("keepspacing", false);
+                if (CheckboxWrap(T("Keep line spacing when resizing"), &keep)) SetSettingFlag("keepspacing", keep);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Only the outer row / column changes size"));
+            }
+            if (anyText) {
+                ImGui::Separator();
+                DrawAlignOptions();
+            }
             ImGui::Separator();
             FlowRow row(ImGui::GetStyle().ItemSpacing.x);
             if (selGroupId) { if (row.Button(T("Ungroup"))) UngroupSelection(); }
@@ -540,6 +589,7 @@ void App::DrawProperties() {
                     InvalidatePage(sel.page);
                 }
                 if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Text colour");
+                DrawAlignOptions();
                 if (uiShotOpenAll) ImGui::SetNextItemOpen(true);
                 if (ImGui::TreeNode(T("Change font / size###chfont"))) {
                     static float newSize = 0;
@@ -584,17 +634,21 @@ void App::DrawProperties() {
                 }
             }
 
-            if (t == FPDF_PAGEOBJ_PATH) {
-                ops::StrokeProps st = ops::ReadStroke(sel.obj);
+            if (t == FPDF_PAGEOBJ_PATH || (t == FPDF_PAGEOBJ_IMAGE && ops::IsLine(sel.obj))) {
                 DrawLineThickness(*this);
-                float lc[3] = { st.r / 255.0f, st.g / 255.0f, st.b / 255.0f };
-                if (ImGui::ColorEdit3(T("Line colour##lc"), lc, ImGuiColorEditFlags_NoInputs)) {
-                    EnsureSelectionEditable();
-                    ops::SetObjectStroke(doc, sel.page, sel.obj, (unsigned)(lc[0] * 255), (unsigned)(lc[1] * 255),
-                                         (unsigned)(lc[2] * 255), st.width);
-                    InvalidatePage(sel.page);
+                unsigned cr = 0, cg = 0, cb = 0;
+                if (ops::LineColor(sel.obj, cr, cg, cb)) {
+                    float lc[3] = { cr / 255.0f, cg / 255.0f, cb / 255.0f };
+                    if (ImGui::ColorEdit3(T("Line colour##lc"), lc, ImGuiColorEditFlags_NoInputs)) {
+                        EnsureSelectionEditable();
+                        ops::SetLineColor(doc, sel.page, sel.obj, (unsigned)(lc[0] * 255), (unsigned)(lc[1] * 255),
+                                          (unsigned)(lc[2] * 255));
+                        InvalidatePage(sel.page);
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line colour");
                 }
-                if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line colour");
+            }
+            if (t == FPDF_PAGEOBJ_PATH) {
                 int parts = ops::SplittableParts(sel.obj);
                 if (parts > 1 && ImGui::Button(Fmt(T("Split into %d separate lines"), parts).c_str())) SplitSelectedPath(false, 0, 0);
             }
@@ -647,7 +701,7 @@ void App::DrawProperties() {
             row.After();
         }
         ImGui::SetNextItemWidth(std::min(120 * s, ImGui::GetContentRegionAvail().x * 0.45f));
-        ImGui::DragFloat(T("Line width##lw"), &strokeWidth, 0.1f, 0.2f, 20.0f, "%.1f");
+        ImGui::DragFloat(T("Line width##lw"), &strokeWidth, 0.05f, 0.05f, 20.0f, "%.2f");
     }
 
     ImGui::Spacing();
@@ -876,7 +930,7 @@ void App::DrawModals() {
             ImGui::DragFloat(T("Header height##hh"), &tableHeaderH, 0.5f, 6, 200, "%.0f pt");
         }
         ImGui::SetNextItemWidth(numW); ImGui::DragFloat(T("Margin##mg"), &tableMargin, 0.5f, 0, 300, "%.0f pt");
-        ImGui::SetNextItemWidth(numW); ImGui::DragFloat(T("Line width##tlw"), &tableLineW, 0.05f, 0.2f, 10, "%.2f");
+        ImGui::SetNextItemWidth(numW); ImGui::DragFloat(T("Line width##tlw"), &tableLineW, 0.05f, 0.05f, 10, "%.2f");
         ImGui::ColorEdit3(T("Line colour##tlc"), tableColor, ImGuiColorEditFlags_NoInputs);
         ImGui::Separator();
         if (PrimaryButton(T("Create"), ImVec2(ButtonWidth(T("Create"), 110 * s), 0))) {

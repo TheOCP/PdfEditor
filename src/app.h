@@ -112,6 +112,9 @@ public:
     PRect SelectionBounds();
     void MoveSelection(float dxPage, float dyPage);
     void ResizeSelectionTo(PRect target);
+    // Alignment while moving text: guides to other text on the page, snapping.
+    void PrepareAlign();
+    void SnapMove(float& dx, float& dy, bool freePlacement);
     void DeleteSelection();
     void GroupSelection();
     void UngroupSelection();
@@ -216,6 +219,14 @@ public:
     int ghostPage = -1;                     // cross-page drop preview
     PRect ghostRect;
 
+    // alignment while moving text
+    PRect moveStart;                        // selection bounds when the move began
+    bool alignOn = false;                   // the moved selection contains text
+    bool alignHasOrigin = false;            // ...with a horizontal baseline
+    float alignOx = 0, alignOy = 0;         // where that baseline started
+    std::vector<ops::AlignRef> alignCands;  // other text on the page
+    std::vector<float> guideX, guideY;      // guide lines on screen now (page points)
+
     // multi-selection / grouping
     std::vector<FPDF_PAGEOBJECT> groupSel;
     int selGroupId = 0;
@@ -243,7 +254,7 @@ public:
     bool tableHeader = true;
     float tableHeaderH = 24.0f;
     float tableMargin = 54.0f;
-    float tableLineW = 1.0f;
+    float tableLineW = 0.5f;
     float tableColor[3] = { 0, 0, 0 };
 
     // search

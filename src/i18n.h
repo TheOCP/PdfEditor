@@ -26,6 +26,10 @@ const char* K(const char* shortcut);
 float UiScaleSetting();
 void SetUiScaleSetting(float s);
 
+// On/off options (keep line spacing, alignment guides, ...), remembered.
+bool SettingFlag(const char* key, bool def);
+void SetSettingFlag(const char* key, bool on);
+
 void LoadSettings();   // reads the settings file; first start: language from Windows
 void SaveSettings();
 

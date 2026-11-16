@@ -164,13 +164,45 @@ void App::ResizeSelectionTo(PRect target) {
         InvalidatePage(sel.page);
         return;
     }
-    // One affine for every member keeps shared corners together (grid stays exact).
+    // Lines keep their thickness, text its size; with "keep line spacing" only
+    // the outer row / column changes.
     PRect cur = SelectionBounds();
-    float sx = (cur.W() > 0.5f && target.W() > 0) ? target.W() / cur.W() : 1.0f;
-    float sy = (cur.H() > 0.5f && target.H() > 0) ? target.H() / cur.H() : 1.0f;
-    FS_MATRIX m{ sx, 0, 0, sy, target.l - cur.l * sx, target.b - cur.b * sy };
-    for (auto o : groupSel) ops::TransformObjectPage(doc, sel.page, o, m);
+    ops::ResizeGroup(doc, sel.page, groupSel, cur, target, SettingFlag("keepspacing", false));
     InvalidatePage(sel.page);
+}
+
+// ------------------------------------------------------------- alignment
+
+void App::PrepareAlign() {
+    alignCands.clear();
+    guideX.clear(); guideY.clear();
+    alignOn = false; alignHasOrigin = false;
+    if (!sel.Valid(doc)) return;
+    std::vector<FPDF_PAGEOBJECT> mine = groupSel.size() > 1 ? groupSel : std::vector<FPDF_PAGEOBJECT>{ sel.obj };
+    for (auto o : mine) {
+        if (ops::ObjectType(o) != FPDF_PAGEOBJ_TEXT) continue;
+        alignOn = true;
+        FS_MATRIX acc = (o == sel.obj) ? sel.accum : FS_MATRIX{ 1, 0, 0, 1, 0, 0 };
+        if (!alignHasOrigin && ops::TextOrigin(o, acc, alignOx, alignOy)) alignHasOrigin = true;
+    }
+    if (alignOn) alignCands = ops::AlignRefs(doc, sel.page, mine);
+}
+
+// (dx, dy) = how far the selection would move from where the drag began.
+// Lines it up with the nearest other text (left start, centre, right edge,
+// baseline) when that is within a few pixels.
+void App::SnapMove(float& dx, float& dy, bool freePlacement) {
+    guideX.clear(); guideY.clear();
+    if (!alignOn || alignCands.empty() || !sel.Valid(doc)) return;
+    bool show = SettingFlag("alignguides", true);
+    bool snap = SettingFlag("alignsnap", true) && !freePlacement;
+    if (!show && !snap) return;
+    ImVec2 a = PageToScreenPt(sel.page, 0, 0), b = PageToScreenPt(sel.page, 100, 0);
+    float pxPerPt = std::max(0.01f, std::fabs(b.x - a.x) / 100.0f);
+    float thr = 8.0f * dpiScale / pxPerPt;
+    ops::AlignHit h = ops::AlignSnap(alignCands, moveStart, alignHasOrigin, alignOx, alignOy, dx, dy, thr);
+    if (h.x) { if (snap) dx += h.dx; if (show) guideX.push_back(h.gx); }
+    if (h.y) { if (snap) dy += h.dy; if (show) guideY.push_back(h.gy); }
 }
 
 void App::DeleteSelection() {
@@ -971,6 +1003,23 @@ void App::DrawCanvas() {
             }
         }
     }
+    // --- alignment guides while moving text ---
+    if (dragging && dragMode == 1 && dragArmed && sel.Valid(doc) && sel.page < n && cache[sel.page].laid &&
+        (!guideX.empty() || !guideY.empty())) {
+        PRect pb = doc.PageBox(sel.page);
+        ImU32 gc = IM_COL32(255, 64, 170, 235);
+        float w = std::max(1.0f, 1.25f * dpiScale);
+        for (float x : guideX) {
+            ImVec2 p0, p1;
+            ScreenBox(*this, sel.page, PRect{ x, pb.b, x, pb.t }, p0, p1);
+            dl->AddLine(ImVec2(p0.x, p0.y), ImVec2(p0.x, p1.y), gc, w);
+        }
+        for (float y : guideY) {
+            ImVec2 p0, p1;
+            ScreenBox(*this, sel.page, PRect{ pb.l, y, pb.r, y }, p0, p1);
+            dl->AddLine(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y), gc, w);
+        }
+    }
     // --- drop preview on another page ---
     if (dragging && dragMode == 1 && ghostPage >= 0 && ghostPage < n && cache[ghostPage].laid) {
         ImVec2 p0, p1;
@@ -1131,8 +1180,11 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
                         dragMode = AnnotSelected() ? 6 : 1;
                         dragPage = page; dragStartScreen = mouse;
                         dragLastPx = px; dragLastPy = py;
+                        dragStartPx = px; dragStartPy = py;
                         PRect sb = SelectionBounds();
                         grabDX = px - sb.l; grabDY = py - sb.b;
+                        moveStart = sb;
+                        if (dragMode == 1) PrepareAlign();
                     } else {
                         ClearSelection();
                         dragging = true; dragMode = 5; dragPage = page;
@@ -1220,9 +1272,14 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
         if (dragMode == 1 && dragArmed && sel.Valid(doc)) {
             if (onPage && p2 == dragPage) {
                 ghostPage = -1;
-                float ddx = nx - dragLastPx, ddy = ny - dragLastPy;
-                if (ddx != 0 || ddy != 0) { MoveSelection(ddx, ddy); dragLastPx = nx; dragLastPy = ny; }
+                float rdx = nx - dragStartPx, rdy = ny - dragStartPy;
+                SnapMove(rdx, rdy, io.KeyAlt);          // Alt = place freely
+                PRect cb = SelectionBounds();
+                float ddx = moveStart.l + rdx - cb.l, ddy = moveStart.b + rdy - cb.b;
+                if (std::fabs(ddx) > 1e-4f || std::fabs(ddy) > 1e-4f) MoveSelection(ddx, ddy);
+                dragLastPx = nx; dragLastPy = ny;
             } else if (onPage) {
+                guideX.clear(); guideY.clear();
                 PRect b = SelectionBounds();
                 ghostPage = p2;
                 ghostRect = { nx - grabDX, ny - grabDY, nx - grabDX + b.W(), ny - grabDY + b.H() };
@@ -1288,6 +1345,7 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
             CutPieceFromImage(dragPage, dragRect);
         }
         dragging = false; dragArmed = false; dragMode = 0; dragPage = -1; ghostPage = -1; resizeHandle = -1;
+        guideX.clear(); guideY.clear(); alignCands.clear(); alignOn = false;
     }
 
     // ---- double-click: type into text, or pick out one line ----

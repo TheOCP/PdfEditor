@@ -2268,38 +2268,433 @@ void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, uns
     d.ContentChanged(page);
 }
 
-float LineThickness(FPDF_PAGEOBJECT obj) {
-    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return 0;
-    int fm = 0; FPDF_BOOL st = 0;
-    FPDFPath_GetDrawMode(obj, &fm, &st);
-    if (st && fm == FPDF_FILLMODE_NONE) {
-        float sw = 1;
-        FPDFPageObj_GetStrokeWidth(obj, &sw);
-        return sw * MatrixScale(ObjMatrix(obj));
-    }
-    PRect b = ObjectBounds(obj);
-    return std::min(b.W(), b.H());
+// ---- lines ------------------------------------------------------------------
+// PDFs draw "lines" in several ways, and each needs its own handling:
+//   Stroke  - a stroked path; thickness = stroke width as drawn (the object's
+//             matrix may stretch it differently along x and y)
+//   Bar     - one filled thin shape (a rectangle used as a line)
+//   Bars    - several filled thin shapes in ONE path (a whole table grid drawn
+//             as rectangles); each bar is thinned about its own centre line
+//   Picture - a thin image used as a line
+// Everything is measured in the object's container space (the page for
+// top-level objects).
+
+namespace {
+enum class LineKind { None, Stroke, Bar, Bars, Picture };
+
+struct LineShape {
+    LineKind kind = LineKind::None;
+    float thick = 0;                 // as drawn
+    std::vector<PSub> subs;          // path geometry (object space)
+    std::vector<PRect> boxes;        // container-space box per sub-path
+    std::vector<bool> bar;           // which sub-paths are bars
+    PathStyle style;
+    float strokeVis = 0;             // stroke width as drawn (geometric mean)
+};
+
+bool BarShaped(float w, float h, float maxThin) {
+    float thin = std::min(w, h), lng = std::max(w, h);
+    return thin <= maxThin && lng >= 2.5f * std::max(thin, 0.01f) && lng > 0.5f;
 }
 
-void SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick) {
-    if (!obj || thick <= 0 || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) return;
-    int fm = 0; FPDF_BOOL st = 0;
-    FPDFPath_GetDrawMode(obj, &fm, &st);
-    if (st && fm == FPDF_FILLMODE_NONE) {    // a stroked line: thickness is the stroke width
-        FPDFPageObj_SetStrokeWidth(obj, thick / MatrixScale(ObjMatrix(obj)));
-        d.ContentChanged(page);
-        return;
+// Width of a stroke `sw` drawn across a straight segment (dx,dy) (object space)
+// by the linear part of m: area scale / length scale.
+float StrokeAcross(float sw, const FS_MATRIX& m, float dx, float dy) {
+    float len = std::sqrt(dx * dx + dy * dy);
+    float tx = m.a * dx + m.c * dy, ty = m.b * dx + m.d * dy;
+    float tl = std::sqrt(tx * tx + ty * ty);
+    if (len < 1e-6f || tl < 1e-9f) return sw * MatrixScale(m);
+    return sw * std::fabs(m.a * m.d - m.b * m.c) * len / tl;
+}
+
+// Stroke width as drawn for every straight segment of the path.
+std::vector<float> StrokeWidthsAcross(const std::vector<PSub>& subs, const FS_MATRIX& m, float sw) {
+    std::vector<float> out;
+    for (const PSub& sp : subs) {
+        PPt cur = sp.start;
+        for (const POp& op : sp.ops) {
+            PPt to = op.end;                         // a curve counts by its chord
+            float dx = to.x - cur.x, dy = to.y - cur.y;
+            if (dx * dx + dy * dy > 1e-8f) out.push_back(StrokeAcross(sw, m, dx, dy));
+            cur = op.end;
+        }
+        if (sp.closed) {
+            float dx = sp.start.x - cur.x, dy = sp.start.y - cur.y;
+            if (dx * dx + dy * dy > 1e-8f) out.push_back(StrokeAcross(sw, m, dx, dy));
+        }
     }
-    PRect b = ObjectBounds(obj);             // a filled bar: grow its short side about the centre
-    float w = b.W(), h = b.H();
-    if (w <= h) {
-        float cx = (b.l + b.r) * 0.5f, sx = thick / std::max(w, 0.01f);
-        Xform(obj, sx, 0, 0, 1, cx - sx * cx, 0);
-    } else {
-        float cy = (b.b + b.t) * 0.5f, sy = thick / std::max(h, 0.01f);
-        Xform(obj, 1, 0, 0, sy, 0, cy - sy * cy);
+    return out;
+}
+
+LineShape ClassifyLine(FPDF_PAGEOBJECT obj) {
+    LineShape ls;
+    if (!obj) return ls;
+    int type = FPDFPageObj_GetType(obj);
+    if (type == FPDF_PAGEOBJ_IMAGE) {
+        PRect b = ObjectBounds(obj);
+        if (BarShaped(b.W(), b.H(), 20.0f) && std::max(b.W(), b.H()) >= 4.0f * std::max(std::min(b.W(), b.H()), 0.01f)) {
+            ls.kind = LineKind::Picture;
+            ls.thick = std::min(b.W(), b.H());
+        }
+        return ls;
+    }
+    if (type != FPDF_PAGEOBJ_PATH) return ls;
+    ls.subs = ParsePath(obj);
+    if (ls.subs.empty()) return ls;
+    ls.style = ReadPathStyle(obj);
+    const FS_MATRIX& m = ls.style.m;
+    bool fill = ls.style.fillMode != FPDF_FILLMODE_NONE;
+    bool stroke = ls.style.stroke;
+    ls.strokeVis = stroke ? ls.style.sw * MatrixScale(m) : 0.0f;
+
+    std::vector<std::vector<PPt>> polys;
+    std::vector<bool> closed;
+    Polylines(ls.subs, m, polys, closed);
+    int bars = 0;
+    for (const auto& poly : polys) {
+        PRect bx{ 1e30f, 1e30f, -1e30f, -1e30f };
+        for (PPt q : poly) {
+            bx.l = std::min(bx.l, q.x); bx.r = std::max(bx.r, q.x);
+            bx.b = std::min(bx.b, q.y); bx.t = std::max(bx.t, q.y);
+        }
+        ls.boxes.push_back(bx);
+        bool isBar = fill && BarShaped(bx.W(), bx.H(), 40.0f);
+        ls.bar.push_back(isBar);
+        bars += isBar ? 1 : 0;
+    }
+
+    auto strokeThick = [&]() {
+        auto ws = StrokeWidthsAcross(ls.subs, m, ls.style.sw);
+        float t = 0;
+        for (float w : ws) t = std::max(t, w);
+        return t > 0 ? t : ls.strokeVis;
+    };
+
+    if (fill && ls.subs.size() == 1 && bars == 1) {
+        ls.kind = LineKind::Bar;
+        PRect b = ObjectBounds(obj);                 // includes the outline, if any
+        ls.thick = std::min(b.W(), b.H());
+    } else if (fill && ls.subs.size() > 1 && bars > 0) {
+        ls.kind = LineKind::Bars;
+        for (size_t k = 0; k < ls.boxes.size(); ++k)
+            if (ls.bar[k]) ls.thick = std::max(ls.thick, std::min(ls.boxes[k].W(), ls.boxes[k].H()) + ls.strokeVis);
+    } else if (stroke) {
+        ls.kind = LineKind::Stroke;                  // a stroked line, outline or box border
+        ls.thick = strokeThick();
+    }
+    return ls;
+}
+
+// Puts `repl` where `old` was (top-level only) and destroys `old`.
+FPDF_PAGEOBJECT ReplaceTopLevel(Document& d, int page, FPDF_PAGEOBJECT old, FPDF_PAGEOBJECT repl) {
+    FPDF_PAGE p = d.Page(page);
+    int idx = p ? TopIndex(p, old) : -1;
+    if (idx < 0) { FPDFPageObj_Destroy(repl); return old; }
+    InsertAt(p, repl, idx + 1);
+    if (FPDFPage_RemoveObject(p, old)) FPDFPageObj_Destroy(old);
+    d.ContentChanged(page);
+    return repl;
+}
+
+PSub MapSub(const PSub& s, const FS_MATRIX& m) {
+    auto mp = [&](PPt p) { PPt o; MatApply(m, p.x, p.y, o.x, o.y); return o; };
+    PSub o = s;
+    o.start = mp(s.start);
+    for (POp& op : o.ops) { op.c1 = mp(op.c1); op.c2 = mp(op.c2); op.end = mp(op.end); }
+    return o;
+}
+
+// Scales a sub-path across its thin axis about its centre line.
+void ThinSub(PSub& s, const PRect& box, float k) {
+    bool horiz = box.W() >= box.H();
+    float c = horiz ? (box.b + box.t) * 0.5f : (box.l + box.r) * 0.5f;
+    auto f = [&](PPt& p) { if (horiz) p.y = c + (p.y - c) * k; else p.x = c + (p.x - c) * k; };
+    f(s.start);
+    for (POp& op : s.ops) { f(op.c1); f(op.c2); f(op.end); }
+}
+}  // namespace
+
+bool IsLine(FPDF_PAGEOBJECT obj) { return ClassifyLine(obj).kind != LineKind::None; }
+
+const char* LineKindName(FPDF_PAGEOBJECT obj) {
+    switch (ClassifyLine(obj).kind) {
+    case LineKind::Stroke: return "stroke";
+    case LineKind::Bar: return "bar";
+    case LineKind::Bars: return "bars";
+    case LineKind::Picture: return "picture";
+    default: return "";
+    }
+}
+
+float LineThickness(FPDF_PAGEOBJECT obj) { return ClassifyLine(obj).thick; }
+
+FPDF_PAGEOBJECT SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick) {
+    if (!obj || thick <= 0) return obj;
+    LineShape ls = ClassifyLine(obj);
+    switch (ls.kind) {
+    case LineKind::None:
+        return obj;
+
+    case LineKind::Stroke: {
+        const FS_MATRIX& m = ls.style.m;
+        auto ws = StrokeWidthsAcross(ls.subs, m, 1.0f);       // drawn width per unit of stroke width
+        float sum = 0;
+        for (float w : ws) sum += w;
+        float avg = ws.empty() ? MatrixScale(m) : sum / ws.size();
+        float l1 = m.a * m.a + m.b * m.b, l2 = m.c * m.c + m.d * m.d, dot = m.a * m.c + m.b * m.d;
+        float big = std::max(l1, l2);
+        bool uniform = std::fabs(l1 - l2) <= 0.01f * big && std::fabs(dot) <= 0.01f * big;
+        if (uniform) {                                       // same scale in every direction: exact
+            FPDFPageObj_SetStrokeWidth(obj, thick / MatrixScale(m));
+            d.ContentChanged(page);
+            return obj;
+        }
+        // Stretched (a unit line scaled 500x along x, a box scaled unevenly):
+        // draw the geometry as it appears, so one stroke width is the same on
+        // every side and the bounds are exact again.
+        std::vector<PSub> subs;
+        for (const PSub& s : ls.subs) subs.push_back(MapSub(s, m));
+        FPDF_PAGEOBJECT repl = BuildPath(subs);
+        if (!repl) return obj;
+        PathStyle st = ls.style;
+        st.m = FS_MATRIX{ 1, 0, 0, 1, 0, 0 };
+        float ms = MatrixScale(m);
+        for (float& v : st.dash) v *= ms;
+        st.phase *= ms;
+        st.sw = thick;
+        ApplyPathStyle(d, page, repl, st, st.fillMode != FPDF_FILLMODE_NONE, true);
+        FPDF_PAGEOBJECT out = ReplaceTopLevel(d, page, obj, repl);
+        if (out == obj) {                                    // nested: best possible in place
+            FPDFPageObj_SetStrokeWidth(obj, thick / std::max(avg, 1e-6f));
+            d.ContentChanged(page);
+        }
+        return out;
+    }
+
+    case LineKind::Bar: {
+        // Scale the short side about the centre; an outline scales along with it,
+        // so the drawn thickness (fill + outline) becomes exactly `thick`.
+        PRect b = ObjectBounds(obj);
+        if (b.W() <= b.H()) {
+            float cx = (b.l + b.r) * 0.5f, sx = thick / std::max(b.W(), 0.01f);
+            Xform(obj, sx, 0, 0, 1, cx - sx * cx, 0);
+        } else {
+            float cy = (b.b + b.t) * 0.5f, sy = thick / std::max(b.H(), 0.01f);
+            Xform(obj, 1, 0, 0, sy, 0, cy - sy * cy);
+        }
+        d.ContentChanged(page);
+        return obj;
+    }
+
+    case LineKind::Bars: {
+        // Rebuild the path with every bar thinned about its own centre line;
+        // other shapes in the same path stay exactly as they were.
+        const FS_MATRIX& m = ls.style.m;
+        PathStyle st = ls.style;
+        float outline = ls.strokeVis;
+        float geom = thick;
+        if (st.stroke) {
+            if (thick <= outline) { geom = 0.0f; outline = thick; }
+            else geom = thick - outline;
+        }
+        std::vector<PSub> subs;
+        for (size_t k = 0; k < ls.subs.size(); ++k) {
+            PSub s = MapSub(ls.subs[k], m);
+            if (ls.bar[k]) {
+                float cur = std::min(ls.boxes[k].W(), ls.boxes[k].H());
+                if (cur > 1e-4f) ThinSub(s, ls.boxes[k], geom / cur);
+            }
+            subs.push_back(s);
+        }
+        FPDF_PAGEOBJECT repl = BuildPath(subs);
+        if (!repl) return obj;
+        st.m = FS_MATRIX{ 1, 0, 0, 1, 0, 0 };
+        if (st.stroke) st.sw = outline;
+        ApplyPathStyle(d, page, repl, st, true, st.stroke);
+        return ReplaceTopLevel(d, page, obj, repl);
+    }
+
+    case LineKind::Picture: {
+        PRect b = ObjectBounds(obj);
+        if (b.W() <= b.H()) {
+            float cx = (b.l + b.r) * 0.5f, sx = thick / std::max(b.W(), 0.01f);
+            Xform(obj, sx, 0, 0, 1, cx - sx * cx, 0);
+        } else {
+            float cy = (b.b + b.t) * 0.5f, sy = thick / std::max(b.H(), 0.01f);
+            Xform(obj, 1, 0, 0, sy, 0, cy - sy * cy);
+        }
+        d.ContentChanged(page);
+        return obj;
+    }
+    }
+    return obj;
+}
+
+bool LineColor(FPDF_PAGEOBJECT obj, unsigned& r, unsigned& g, unsigned& b) {
+    LineShape ls = ClassifyLine(obj);
+    unsigned a = 255;
+    if (ls.kind == LineKind::Stroke) return FPDFPageObj_GetStrokeColor(obj, &r, &g, &b, &a) != 0;
+    if (ls.kind == LineKind::Bar || ls.kind == LineKind::Bars) return FPDFPageObj_GetFillColor(obj, &r, &g, &b, &a) != 0;
+    return false;
+}
+
+void SetLineColor(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b) {
+    LineShape ls = ClassifyLine(obj);
+    if (ls.kind == LineKind::Stroke || ((ls.kind == LineKind::Bar || ls.kind == LineKind::Bars) && ls.style.stroke))
+        FPDFPageObj_SetStrokeColor(obj, r, g, b, ls.style.sa ? ls.style.sa : 255);
+    if (ls.kind == LineKind::Bar || ls.kind == LineKind::Bars)
+        FPDFPageObj_SetFillColor(obj, r, g, b, ls.style.fa ? ls.style.fa : 255);
+    if (ls.kind != LineKind::None && ls.kind != LineKind::Picture) d.ContentChanged(page);
+}
+
+bool TextOrigin(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum, float& x, float& y) {
+    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT) return false;
+    FS_MATRIX m = ObjMatrix(obj);
+    float ax = 0, ay = 0, bx = 0, by = 0;
+    MatApply(accum, m.e, m.f, ax, ay);
+    MatApply(accum, m.e + m.a, m.f + m.b, bx, by);           // the text's x direction on the page
+    if (std::fabs(by - ay) > 0.02f * std::fabs(bx - ax) || bx <= ax) return false;
+    x = ax; y = ay;
+    return true;
+}
+
+std::vector<AlignRef> AlignRefs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& exclude) {
+    std::vector<AlignRef> out;
+    for (const auto& oi : ListObjects(d, page)) {
+        if (oi.type != FPDF_PAGEOBJ_TEXT) continue;
+        if (std::find(exclude.begin(), exclude.end(), oi.obj) != exclude.end()) continue;
+        if (oi.bounds.W() <= 0.1f || oi.bounds.H() <= 0.1f) continue;
+        AlignRef r;
+        r.box = oi.bounds;
+        r.origin = TextOrigin(oi.obj, oi.accum, r.ox, r.oy);
+        out.push_back(r);
+    }
+    return out;
+}
+
+AlignHit AlignSnap(const std::vector<AlignRef>& refs, PRect start, bool hasOrigin, float ox, float oy,
+                   float dx, float dy, float thr) {
+    AlignHit h;
+    float L = (hasOrigin ? ox : start.l) + dx;
+    float C = (start.l + start.r) * 0.5f + dx;
+    float R = start.r + dx;
+    float B = (hasOrigin ? oy : start.b) + dy;
+    float bx = 1e30f, by = 1e30f;
+    auto tryX = [&](float mine, float g) { float d = g - mine; if (std::fabs(d) < std::fabs(bx)) { bx = d; h.gx = g; } };
+    auto tryY = [&](float mine, float g) { float d = g - mine; if (std::fabs(d) < std::fabs(by)) { by = d; h.gy = g; } };
+    for (const AlignRef& r : refs) {
+        if (hasOrigin == r.origin) {          // like with like: baseline starts, or boxes
+            tryX(L, r.origin ? r.ox : r.box.l);
+            tryY(B, r.origin ? r.oy : r.box.b);
+        }
+        tryX(R, r.box.r);
+        tryX(C, (r.box.l + r.box.r) * 0.5f);
+    }
+    if (std::fabs(bx) <= thr) { h.x = true; h.dx = bx; }
+    if (std::fabs(by) <= thr) { h.y = true; h.dy = by; }
+    return h;
+}
+
+// ---- resizing several objects (a table) --------------------------------------
+
+PRect ResizeGroup(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& objs, PRect cur, PRect target,
+                  bool keepSpacing) {
+    if (objs.empty() || cur.W() <= 0.01f || cur.H() <= 0.01f || target.W() <= 0.5f || target.H() <= 0.5f) return cur;
+    struct Item { FPDF_PAGEOBJECT o; PRect b; int kind; };   // kind: 0 other, 1 horizontal line, 2 vertical line, 3 text
+    std::vector<Item> items;
+    bool hasLines = false;
+    for (auto o : objs) {
+        Item it{ o, ObjectBounds(o), 0 };
+        if (FPDFPageObj_GetType(o) == FPDF_PAGEOBJ_TEXT) it.kind = 3;
+        else if (IsLine(o)) {
+            if (it.b.W() >= 2 * it.b.H()) it.kind = 1;
+            else if (it.b.H() >= 2 * it.b.W()) it.kind = 2;
+        }
+        hasLines |= it.kind == 1 || it.kind == 2;
+        items.push_back(it);
+    }
+
+    float sx = target.W() / cur.W(), sy = target.H() / cur.H();
+    auto mapX = [&](float x) { return target.l + (x - cur.l) * sx; };
+    auto mapY = [&](float y) { return target.b + (y - cur.b) * sy; };
+
+    // Maps [b.l,b.r]x[b.b,b.t] onto [nl,nr]x[nb,nt] (the short side of a line
+    // is only moved, never scaled, so its thickness stays the same).
+    auto place = [&](const Item& it, float nl, float nr, float nb, float nt) {
+        const PRect& b = it.b;
+        float kx = b.W() > 0.01f ? (nr - nl) / b.W() : 1.0f;
+        float ky = b.H() > 0.01f ? (nt - nb) / b.H() : 1.0f;
+        if (std::fabs(kx - 1) < 1e-6f && std::fabs(ky - 1) < 1e-6f && std::fabs(nl - b.l) < 1e-6f && std::fabs(nb - b.b) < 1e-6f)
+            return;
+        Xform(it.o, kx, 0, 0, ky, nl - b.l * kx, nb - b.b * ky);
+    };
+
+    if (!keepSpacing) {
+        if (!hasLines) {                    // plain group: scale everything as one picture
+            for (const Item& it : items) Xform(it.o, sx, 0, 0, sy, target.l - cur.l * sx, target.b - cur.b * sy);
+        } else {
+            for (const Item& it : items) {
+                const PRect& b = it.b;
+                if (it.kind == 1) {          // horizontal line: new length and row position, same thickness
+                    float cy = (b.b + b.t) * 0.5f, dy = mapY(cy) - cy;
+                    place(it, mapX(b.l), mapX(b.r), b.b + dy, b.t + dy);
+                } else if (it.kind == 2) {   // vertical line
+                    float cx = (b.l + b.r) * 0.5f, dx = mapX(cx) - cx;
+                    place(it, b.l + dx, b.r + dx, mapY(b.b), mapY(b.t));
+                } else if (it.kind == 3) {   // text: same size, moves with its cell
+                    float dx = mapX(b.l) - b.l, dy = mapY(b.b) - b.b;
+                    place(it, b.l + dx, b.r + dx, b.b + dy, b.t + dy);
+                } else {
+                    Xform(it.o, sx, 0, 0, sy, target.l - cur.l * sx, target.b - cur.b * sy);
+                }
+            }
+        }
+        d.ContentChanged(page);
+        return target;
+    }
+
+    // Keep the spacing: only what lies on a dragged edge moves; the outer row /
+    // column takes up the change. An edge stops before it reaches an inner line.
+    float dl = target.l - cur.l, dr = target.r - cur.r, db = target.b - cur.b, dt = target.t - cur.t;
+    auto tolFor = [](const PRect& b) { return 3.0f + std::min(b.W(), b.H()); };
+    float minInX = 1e30f, maxInX = -1e30f, minInY = 1e30f, maxInY = -1e30f;
+    for (const Item& it : items) {
+        float tol = tolFor(it.b);
+        if (it.kind == 2) {
+            float cx = (it.b.l + it.b.r) * 0.5f;
+            if (std::fabs(cx - cur.l) > tol && std::fabs(cx - cur.r) > tol) { minInX = std::min(minInX, cx); maxInX = std::max(maxInX, cx); }
+        } else if (it.kind == 1) {
+            float cy = (it.b.b + it.b.t) * 0.5f;
+            if (std::fabs(cy - cur.b) > tol && std::fabs(cy - cur.t) > tol) { minInY = std::min(minInY, cy); maxInY = std::max(maxInY, cy); }
+        }
+    }
+    const float gap = 2.0f;
+    if (minInX < 1e29f) { dl = std::min(dl, minInX - gap - cur.l); dr = std::max(dr, maxInX + gap - cur.r); }
+    if (minInY < 1e29f) { db = std::min(db, minInY - gap - cur.b); dt = std::max(dt, maxInY + gap - cur.t); }
+    if (cur.W() + dr - dl < 1.0f) { dl = 0; dr = 0; }
+    if (cur.H() + dt - db < 1.0f) { db = 0; dt = 0; }
+
+    for (const Item& it : items) {
+        const PRect& b = it.b;
+        float tol = tolFor(b);
+        auto nearV = [&](float v, float edge) { return std::fabs(v - edge) <= tol; };
+        if (it.kind == 1) {
+            float cy = (b.b + b.t) * 0.5f;
+            float dy = nearV(cy, cur.b) ? db : nearV(cy, cur.t) ? dt : 0.0f;
+            place(it, b.l + (nearV(b.l, cur.l) ? dl : 0), b.r + (nearV(b.r, cur.r) ? dr : 0), b.b + dy, b.t + dy);
+        } else if (it.kind == 2) {
+            float cx = (b.l + b.r) * 0.5f;
+            float dx = nearV(cx, cur.l) ? dl : nearV(cx, cur.r) ? dr : 0.0f;
+            place(it, b.l + dx, b.r + dx, b.b + (nearV(b.b, cur.b) ? db : 0), b.t + (nearV(b.t, cur.t) ? dt : 0));
+        } else if (it.kind == 3) {
+            continue;                        // text stays in its cell
+        } else {
+            place(it, b.l + (nearV(b.l, cur.l) ? dl : 0), b.r + (nearV(b.r, cur.r) ? dr : 0),
+                  b.b + (nearV(b.b, cur.b) ? db : 0), b.t + (nearV(b.t, cur.t) ? dt : 0));
+        }
     }
     d.ContentChanged(page);
+    return PRect{ cur.l + dl, cur.b + db, cur.r + dr, cur.t + dt };
 }
 
 // =============================================================== grouping

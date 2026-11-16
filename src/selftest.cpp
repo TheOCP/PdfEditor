@@ -7,6 +7,7 @@
 #include "imageio.h"
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <windows.h>
@@ -344,6 +345,52 @@ static void RunEditTests() {
     }
 }
 
+// Development aid: how the lines of a real PDF are drawn and whether each one
+// can be made thinner and thicker. Works on a copy in memory; nothing is saved.
+// Reports geometry only (no text).
+int RunLineCheck(const wchar_t* pdf) {
+    fopen_s(&g_log, "line-check.log", "w");
+    PdfInit();
+    int failures = 0;
+    {
+        Document d;
+        std::string err;
+        if (d.LoadFile(pdf, "", err) != Document::Load::Ok) { Out("could not open (%s)\n", err.c_str()); PdfShutdown(); return 2; }
+        Out("pages: %d\n", d.PageCount());
+        for (int pg = 0; pg < d.PageCount(); ++pg) {
+            std::map<std::string, int> kinds;
+            int nested = 0, ok = 0, bad = 0;
+            float tmin = 1e9f, tmax = 0;
+            std::vector<ops::ObjInfo> lines;
+            for (const auto& oi : ops::ListObjects(d, pg))
+                if (ops::IsLine(oi.obj)) lines.push_back(oi);
+            for (const auto& oi : lines) {
+                FPDF_PAGEOBJECT o = oi.obj;
+                kinds[ops::LineKindName(o)]++;
+                float sc = ops::MatrixScale(oi.accum);
+                float t0 = ops::LineThickness(o) * sc;
+                tmin = std::min(tmin, t0); tmax = std::max(tmax, t0);
+                if (oi.parent) { ++nested; ops::PromoteObject(d, pg, o); sc = 1.0f; }
+                o = ops::SetLineThickness(d, pg, o, 0.3f / sc);
+                bool thin = std::fabs(ops::LineThickness(o) * sc - 0.3f) < 0.03f;
+                o = ops::SetLineThickness(d, pg, o, 3.0f / sc);
+                bool thick = std::fabs(ops::LineThickness(o) * sc - 3.0f) < 0.1f;
+                if (thin && thick) ++ok; else ++bad;
+            }
+            std::string ks;
+            for (const auto& [k, n] : kinds) ks += k + "=" + std::to_string(n) + " ";
+            if (lines.empty()) Out("page %d: no lines\n", pg + 1);
+            else Out("page %d: %zu lines (%s) nested=%d thickness %.2f..%.2f pt -> thinner+thicker ok=%d failed=%d\n",
+                     pg + 1, lines.size(), ks.c_str(), nested, tmin, tmax, ok, bad);
+            failures += bad;
+        }
+    }
+    PdfShutdown();
+    Out("%s\n", failures ? "SOME LINES FAILED" : "ALL LINES OK");
+    if (g_log) fclose(g_log);
+    return failures ? 1 : 0;
+}
+
 int RunSelfTest() {
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
     FILE* f;
@@ -446,6 +493,160 @@ int RunSelfTest() {
         FPDF_PAGEOBJECT bar = ops::AddRect(d2, 0, { 50, 100, 350, 103 }, true, 0, 0, 0, false, 0, 0, 0, 1);  // filled 3pt bar
         ops::SetLineThickness(d2, 0, bar, 10.0f);
         Check(std::fabs(ops::LineThickness(bar) - 10.0f) < 0.6f, "filled horizontal bar thickened by geometry");
+        ops::SetLineThickness(d2, 0, bar, 0.5f);
+        Check(std::fabs(ops::LineThickness(bar) - 0.5f) < 0.05f, "filled bar made thinner");
+    }
+
+    // ---- existing lines drawn in other ways can be made thinner ----
+    Out("\nExisting lines (stretched, grid as one shape, picture):\n");
+    {
+        Document d3;
+        d3.CreateBlank(612, 792);
+        FPDF_PAGE p3 = d3.Page(0);
+        // A unit line stretched 500x along x: drawn 2 pt thick, but sqrt(det) = 31.6.
+        FPDF_PAGEOBJECT st = FPDFPageObj_CreateNewPath(0, 0);
+        FPDFPath_LineTo(st, 1, 0);
+        FPDFPath_SetDrawMode(st, FPDF_FILLMODE_NONE, 1);
+        FPDFPageObj_SetStrokeColor(st, 0, 0, 0, 255);
+        FPDFPageObj_SetStrokeWidth(st, 2.0f);
+        FPDFPageObj_Transform(st, 500, 0, 0, 1, 50, 700);
+        FPDFPage_InsertObject(p3, st);
+        Check(std::fabs(ops::LineThickness(st) - 2.0f) < 0.05f, "stretched stroked line: real thickness read (2 pt)");
+        st = ops::SetLineThickness(d3, 0, st, 0.5f);
+        Check(std::fabs(ops::LineThickness(st) - 0.5f) < 0.05f, "stretched stroked line made thinner (0.5 pt)");
+        PRect sb = ops::ObjectBounds(st);
+        Check(sb.W() > 495 && sb.W() < 505, "...and keeps its length");
+
+        // A stroked box stretched unevenly: rebuilt so every side gets the same width.
+        FPDF_PAGEOBJECT bx = FPDFPageObj_CreateNewRect(0, 0, 1, 1);
+        FPDFPath_SetDrawMode(bx, FPDF_FILLMODE_NONE, 1);
+        FPDFPageObj_SetStrokeColor(bx, 0, 0, 0, 255);
+        FPDFPageObj_SetStrokeWidth(bx, 0.02f);
+        FPDFPageObj_Transform(bx, 200, 0, 0, 50, 100, 500);
+        FPDFPage_InsertObject(p3, bx);
+        bx = ops::SetLineThickness(d3, 0, bx, 1.0f);
+        Check(std::fabs(ops::LineThickness(bx) - 1.0f) < 0.05f, "unevenly stretched box border set to 1 pt");
+
+        // A whole grid drawn as ONE filled path of 2 pt rectangles + a big filled cell.
+        FPDF_PAGEOBJECT grid = FPDFPageObj_CreateNewPath(50, 300);
+        auto rect = [&](float x, float y, float w, float h) {
+            FPDFPath_MoveTo(grid, x, y); FPDFPath_LineTo(grid, x + w, y); FPDFPath_LineTo(grid, x + w, y + h);
+            FPDFPath_LineTo(grid, x, y + h); FPDFPath_Close(grid);
+        };
+        rect(50, 300, 400, 2);      // bottom
+        rect(50, 400, 400, 2);      // top
+        rect(50, 300, 2, 102);      // left
+        rect(448, 300, 2, 102);     // right
+        rect(100, 320, 60, 60);     // a filled square (not a line)
+        FPDFPath_SetDrawMode(grid, FPDF_FILLMODE_WINDING, 0);
+        FPDFPageObj_SetFillColor(grid, 0, 0, 0, 255);
+        FPDFPage_InsertObject(p3, grid);
+        Check(std::fabs(ops::LineThickness(grid) - 2.0f) < 0.05f, "grid drawn as one shape: line thickness 2 pt (not its size)");
+        grid = ops::SetLineThickness(d3, 0, grid, 0.5f);
+        Check(std::fabs(ops::LineThickness(grid) - 0.5f) < 0.05f, "grid lines made thinner (0.5 pt)");
+        PRect gb = ops::ObjectBounds(grid);
+        Check(gb.W() > 398 && gb.H() > 98, "grid keeps its size");
+        bool squareKept = false;
+        for (const auto& oi : ops::ListObjects(d3, 0))
+            if (oi.obj == grid) squareKept = ops::DistanceToObject(grid, 130, 350) < 0.01f;
+        Check(squareKept, "the filled square in the same shape is untouched");
+
+        // A thin picture used as a line.
+        Image img;
+        img.w = 200; img.h = 2;
+        img.px.assign((size_t)img.w * img.h, 0xFF000000u);   // opaque black
+        std::string ierr;
+        FPDF_PAGEOBJECT pic = ops::AddImage(d3, 0, img, 300, 150, 400, ierr);
+        Check(pic && ops::IsLine(pic), "thin picture counts as a line");
+        if (pic) {
+            float t0 = ops::LineThickness(pic);
+            ops::SetLineThickness(d3, 0, pic, t0 / 4);
+            Check(std::fabs(ops::LineThickness(pic) - t0 / 4) < 0.05f, "picture line made thinner");
+        }
+        Check(!ops::IsLine(ops::AddRect(d3, 0, { 300, 300, 400, 380 }, true, 0, 0, 0, false, 0, 0, 0, 1)),
+              "a filled box is not a line");
+
+        // Round trip.
+        d3.Bake();
+        Bytes b3; d3.SaveBytes(b3, 0);
+        Document r3; std::string e3;
+        Check(r3.LoadBytes(std::make_shared<Bytes>(b3), "", e3) == Document::Load::Ok, "thinned lines survive save + reload");
+    }
+
+    // ---- resizing a table: lines keep their thickness, optional fixed spacing ----
+    Out("\nTable resize (thickness kept, spacing kept on request):\n");
+    {
+        auto build = [](Document& t) {
+            t.CreateBlank(612, 792);
+            ops::AddTable(t, 0, { 100, 400, 400, 700 }, 3, 3, false, 0, 0, 0, 0, 1.0f);   // rows 100 pt, cols 100 pt
+            std::vector<FPDF_PAGEOBJECT> all;
+            for (const auto& oi : ops::ListObjects(t, 0)) all.push_back(oi.obj);
+            return all;
+        };
+        auto bounds = [](const std::vector<FPDF_PAGEOBJECT>& v) {
+            PRect u = ops::ObjectBounds(v[0]);
+            for (auto o : v) u = u.Union(ops::ObjectBounds(o));
+            return u;
+        };
+        auto rowsY = [](const std::vector<FPDF_PAGEOBJECT>& v) {
+            std::vector<float> ys;
+            for (auto o : v) { PRect b = ops::ObjectBounds(o); if (b.W() > b.H()) ys.push_back((b.b + b.t) / 2); }
+            std::sort(ys.begin(), ys.end());
+            return ys;
+        };
+        {
+            Document t;
+            auto all = build(t);
+            PRect cur = bounds(all);
+            PRect target{ cur.l, cur.b - cur.H(), cur.r, cur.t };            // twice as tall
+            for (int step = 1; step <= 10; ++step) {                         // like dragging the mouse
+                PRect c = bounds(all);
+                PRect tg{ cur.l, cur.b - cur.H() * step / 10.0f, cur.r, cur.t };
+                ops::ResizeGroup(t, 0, all, c, tg, false);
+            }
+            (void)target;
+            float maxT = 0;
+            for (auto o : all) maxT = std::max(maxT, ops::LineThickness(o));
+            Check(std::fabs(maxT - 1.0f) < 0.02f, "taller table: lines still 1 pt thick");
+            auto ys = rowsY(all);
+            Check(ys.size() == 4 && std::fabs((ys[1] - ys[0]) - (ys[3] - ys[2])) < 1.0f && ys[1] - ys[0] > 180,
+                  "taller table: rows stay evenly spaced (about 200 pt)");
+        }
+        {
+            Document t;
+            auto all = build(t);
+            PRect cur = bounds(all);
+            auto ys0 = rowsY(all);
+            for (int step = 1; step <= 10; ++step) {
+                PRect c = bounds(all);
+                PRect tg{ cur.l, cur.b - 50.0f * step / 10.0f, cur.r + 30.0f * step / 10.0f, cur.t };
+                ops::ResizeGroup(t, 0, all, c, tg, true);
+            }
+            auto ys = rowsY(all);
+            Check(ys.size() == 4 && std::fabs((ys[2] - ys[1]) - (ys0[2] - ys0[1])) < 0.01f &&
+                  std::fabs((ys[3] - ys[2]) - (ys0[3] - ys0[2])) < 0.01f, "keep spacing: inner row spacing unchanged");
+            Check(std::fabs((ys[1] - ys[0]) - (ys0[1] - ys0[0] + 50)) < 0.5f, "keep spacing: only the bottom row grew");
+            PRect nb = bounds(all);
+            Check(std::fabs(nb.W() - (cur.W() + 30)) < 0.5f, "keep spacing: table got wider by the drag");
+            // shrink far past the inner line: stops before it
+            PRect c = bounds(all);
+            PRect got = ops::ResizeGroup(t, 0, all, c, PRect{ c.l, c.b + 400, c.r, c.t }, true);
+            auto ys2 = rowsY(all);
+            Check(ys2[0] < ys2[1] && got.b < ys2[1], "keep spacing: an edge never crosses an inner line");
+        }
+    }
+
+    // ---- text baseline for alignment ----
+    Out("\nAlignment helper:\n");
+    {
+        Document a;
+        a.CreateBlank(612, 792);
+        std::string aerr;
+        FontChoice fc; fc.stdName = "Helvetica";
+        FPDF_PAGEOBJECT t1 = ops::AddText(a, 0, L"Left aligned", fc, 12, 72, 700, 0, 0, 0, aerr);
+        float ox = 0, oy = 0;
+        Check(t1 && ops::TextOrigin(t1, FS_MATRIX{ 1, 0, 0, 1, 0, 0 }, ox, oy) && std::fabs(ox - 72) < 0.5f,
+              "text origin = where its baseline starts");
     }
 
     // ---- split one multi-line path into movable lines ----

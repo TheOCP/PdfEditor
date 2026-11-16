@@ -193,10 +193,43 @@ int AddTable(Document& d, int page, PRect box, int cols, int rows, bool header, 
 struct StrokeProps { bool isPath = false; float width = 1; unsigned r = 0, g = 0, b = 0, a = 255; };
 StrokeProps ReadStroke(FPDF_PAGEOBJECT obj);
 void SetObjectStroke(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, float width);
-// Visible line thickness in page points: stroke width x matrix scale for a
-// stroked line, the short side for a filled bar. Works in any orientation.
+// Lines, however the PDF draws them: a stroked path, a thin filled rectangle,
+// a whole grid of thin rectangles in one path, or a thin picture.
+bool  IsLine(FPDF_PAGEOBJECT obj);
+// "stroke", "bar", "bars", "picture" or "" (for reports).
+const char* LineKindName(FPDF_PAGEOBJECT obj);
+// Thickness as drawn (container space; page points for top-level objects).
 float LineThickness(FPDF_PAGEOBJECT obj);
-void  SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick);
+// Makes the line exactly `thick` thick - thinner or thicker. Some lines have to
+// be rebuilt as a new object: the object that now is the line is returned.
+FPDF_PAGEOBJECT SetLineThickness(Document& d, int page, FPDF_PAGEOBJECT obj, float thick);
+// Colour a line is drawn in (stroke for stroked lines, fill for bars).
+bool LineColor(FPDF_PAGEOBJECT obj, unsigned& r, unsigned& g, unsigned& b);
+void SetLineColor(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b);
+
+// Where a horizontal text's baseline starts (page space). False for rotated
+// or non-text objects.
+bool TextOrigin(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum, float& x, float& y);
+
+// ---- alignment: moving text into line with other text ----
+struct AlignRef { float ox = 0, oy = 0; bool origin = false; PRect box; };
+// Every text on `page` except `exclude`, as things to line up with.
+std::vector<AlignRef> AlignRefs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& exclude);
+struct AlignHit { float dx = 0, dy = 0; bool x = false, y = false; float gx = 0, gy = 0; };
+// A selection with bounds `start` (and baseline origin ox/oy when hasOrigin)
+// is being moved by (dx,dy). Finds the nearest line-up within `thr` points:
+// left start, centre or right edge (x) and baseline (y). Returns the
+// corrections to add and where the guide lines are.
+AlignHit AlignSnap(const std::vector<AlignRef>& refs, PRect start, bool hasOrigin, float ox, float oy,
+                   float dx, float dy, float thr);
+
+// Resizes several top-level objects (e.g. a table) from `cur` to `target`.
+// Lines keep their thickness and text keeps its size (it moves with its cell).
+// keepSpacing: the spacing between lines stays as it is - only the lines on
+// the dragged edge move, so the outer row / column takes up the change.
+// Returns the bounds actually reached (an edge stops before an inner line).
+PRect ResizeGroup(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& objs, PRect cur, PRect target,
+                  bool keepSpacing);
 
 // ---- grouping ------------------------------------------------------------
 // Persistent "PEGroup"/id content-mark tag; survives save + reload.

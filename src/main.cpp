@@ -16,6 +16,7 @@
 #include <string>
 
 int RunSelfTest();   // selftest.cpp
+int RunLineCheck(const wchar_t* pdf);   // selftest.cpp: lines of a PDF (read-only)
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -151,7 +152,7 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
     const Cfg cfgs[] = { { 1280, 720, 1.0f }, { 1280, 720, 1.5f }, { 1920, 1080, 1.0f }, { 1920, 1080, 1.5f },
                          { 2560, 1440, 1.0f }, { 3840, 2160, 2.0f }, { 1024, 700, 1.0f } };
     const char* states[] = { "welcome", "main", "text", "group", "toast", "help", "settings", "table", "meta",
-                             "about", "import", "edit", "password", "line", "lines" };
+                             "about", "import", "edit", "password", "line", "lines", "align" };
     SetUiScaleSetting(1.0f);
     for (int li = 0; li < 2; ++li) {
         g_app.ChangeLanguage(li ? Lang::German : Lang::English, false);   // never saved
@@ -215,15 +216,45 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
                     g_app.toast.text.clear();
                     g_app.fitPending = true;
                 }
+                else if (name == "align") {
+                    // Text being dragged next to other text: guides + snapping.
+                    g_app.doc.CreateBlank(595, 842);
+                    g_app.cache.clear();
+                    g_app.thumbs.clear();
+                    FontChoice fc; fc.stdName = "Helvetica";
+                    std::string e;
+                    ops::AddText(g_app.doc, 0, L"Invoice date", fc, 12, 72, 760, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"Amount", fc, 12, 330, 760, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"Description", fc, 12, 72, 730, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"12.50", fc, 12, 330, 700, 0, 0, 0, e);
+                    FPDF_PAGEOBJECT mv = ops::AddText(g_app.doc, 0, L"Total", fc, 12, 74, 702, 0, 0, 0, e);
+                    g_app.doc.Commit("align");
+                    for (auto& o : ops::ListObjects(g_app.doc, 0))
+                        if (o.obj == mv) { g_app.sel.Set(g_app.doc, 0, o); g_app.groupSel = { mv }; break; }
+                    g_app.toast.text.clear();
+                    g_app.fitPending = true;
+                }
                 else if (name == "password") {
                     g_app.pwFile = L"x.pdf";
                     g_app.pwError = "Wrong password, try again.";
                     g_app.showPassword = true;
                 }
                 for (int f = 0; f < 6; ++f) {
+                    if (name == "align" && f == 2 && g_app.sel.Valid(g_app.doc)) {
+                        // as if the text were being dragged by (0,0): snaps onto the left
+                        // edge and the baseline of the text next to it
+                        g_app.dragging = true; g_app.dragArmed = true; g_app.dragMode = 1; g_app.dragPage = 0;
+                        g_app.moveStart = g_app.SelectionBounds();
+                        g_app.PrepareAlign();
+                        float dx = 0, dy = 0;
+                        g_app.SnapMove(dx, dy, false);
+                        g_app.MoveSelection(dx, dy);
+                    }
                     RenderFrame(clear);
                     if (f < 5) GfxPresent();
                 }
+                g_app.dragging = false; g_app.dragArmed = false; g_app.dragMode = 0;
+                g_app.guideX.clear(); g_app.guideY.clear();
                 // Cut-off check: content wider than the space a window shows.
                 ImGuiContext& g = *GImGui;
                 for (ImGuiWindow* w : g.Windows) {
@@ -254,6 +285,14 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   // WIC needs COM, self-test too
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--line-check")) {
+        int argc2 = 0;
+        LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &argc2);
+        int rc = argc2 >= 3 ? RunLineCheck(av[2]) : 2;
+        if (av) LocalFree(av);
+        CoUninitialize();
+        return rc;
+    }
     if (lpCmdLine && wcsstr(lpCmdLine, L"--selftest")) {
         int rc = RunSelfTest();
         CoUninitialize();
