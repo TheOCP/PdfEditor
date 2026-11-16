@@ -9,4 +9,5 @@
     <color name="bg">#FF16161A</color>
     <color name="panel">#FF1E1E23</color>
     <color name="accent">#FF3B82F6</color>
+    <color name="icon_tile">#FFE53935</color>
 </resources>
