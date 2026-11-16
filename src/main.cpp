@@ -6,6 +6,7 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <objbase.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <string>
 
@@ -43,6 +44,20 @@ static void BuildFonts(float scale) {
     ApplyDarkTheme();
     ImGui::GetStyle().ScaleAllSizes(scale);
     g_app.dpiScale = scale;
+}
+
+// Title bar in the editor's own dark grey (the menu bar colour), so the window
+// frame and the app read as one piece. Windows 11 honours the caption colour;
+// Windows 10 at least gets the dark frame.
+static void ApplyTitleBarTheme(HWND hwnd) {
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+    COLORREF caption = RGB(28, 28, 33);    // theme MenuBarBg (0.11, 0.11, 0.13)
+    COLORREF text = RGB(230, 232, 237);    // theme Text
+    COLORREF border = RGB(46, 46, 54);     // theme Border
+    DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd, 36 /*DWMWA_TEXT_COLOR*/, &text, sizeof(text));
+    DwmSetWindowAttribute(hwnd, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
 }
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -99,6 +114,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         return 1;
     }
 
+    ApplyTitleBarTheme(hwnd);
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 

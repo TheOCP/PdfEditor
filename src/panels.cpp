@@ -102,6 +102,8 @@ void App::DrawMenuBar() {
     if (ImGui::BeginMenu("Help")) {
         if (ImGui::MenuItem("How to / keyboard shortcuts", "F1")) showHelp = true;
         if (ImGui::MenuItem("About")) showAbout = true;
+        ImGui::Separator();
+        ImGui::TextDisabled("by TheOCProductions & ShortGG");
         ImGui::EndMenu();
     }
     if (has) {
@@ -657,6 +659,10 @@ void App::DrawModals() {
     if (showHelp) { ImGui::OpenPopup("How to##help"); showHelp = false; }
     ImGui::SetNextWindowSize(ImVec2(620 * dpiScale, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("How to##help", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(0.55f, 0.8f, 1, 1), "PDF Editor");
+        ImGui::SameLine();
+        ImGui::TextDisabled("by TheOCProductions & ShortGG");
+        ImGui::Separator();
         auto row = [](const char* k, const char* v) {
             ImGui::TextColored(ImVec4(0.55f, 0.8f, 1, 1), "%s", k);
             ImGui::SameLine(ImGui::GetFontSize() * 13.0f);
@@ -696,6 +702,7 @@ void App::DrawModals() {
     if (showAbout) { ImGui::OpenPopup("About##ab"); showAbout = false; }
     if (ImGui::BeginPopupModal("About##ab", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("PDF Editor");
+        ImGui::TextColored(ImVec4(0.55f, 0.8f, 1, 1), "by TheOCProductions & ShortGG");
         ImGui::Separator();
         ImGui::TextWrapped("A desktop PDF editor built on PDFium and Dear ImGui (DirectX 11).");
         ImGui::TextDisabled("Rendering: PDFium (BSD-3).  UI: Dear ImGui (MIT).");

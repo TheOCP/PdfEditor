@@ -68,7 +68,7 @@ target_include_directories(PdfEditor PRIVATE
 
 target_link_libraries(PdfEditor PRIVATE
     pdfium
-    d3d11 dxgi d3dcompiler
+    d3d11 dxgi d3dcompiler dwmapi
     comdlg32 ole32 oleaut32 shell32 shlwapi windowscodecs advapi32 user32 gdi32 winspool
 )
 
