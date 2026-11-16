@@ -1,5 +1,6 @@
 #include "pdf_doc.h"
 #include <cmath>
+#include <ctime>
 #include <numeric>
 
 // ------------------------------------------------------------------ matrices
@@ -83,11 +84,21 @@ static void CB_SetCursor(FPDF_FORMFILLINFO* p, int type) { Owner(p)->formCursor 
 static int CB_SetTimer(FPDF_FORMFILLINFO*, int, TimerCallback) { return 0; }
 static void CB_KillTimer(FPDF_FORMFILLINFO*, int) {}
 static FPDF_SYSTEMTIME CB_GetLocalTime(FPDF_FORMFILLINFO*) {
+    FPDF_SYSTEMTIME r;
+#ifdef _WIN32
     SYSTEMTIME st;
     GetLocalTime(&st);
-    FPDF_SYSTEMTIME r;
     r.wYear = st.wYear; r.wMonth = st.wMonth; r.wDayOfWeek = st.wDayOfWeek; r.wDay = st.wDay;
     r.wHour = st.wHour; r.wMinute = st.wMinute; r.wSecond = st.wSecond; r.wMilliseconds = st.wMilliseconds;
+#else
+    time_t now = time(nullptr);
+    tm lt{};
+    localtime_r(&now, &lt);
+    r.wYear = (unsigned short)(lt.tm_year + 1900); r.wMonth = (unsigned short)(lt.tm_mon + 1);
+    r.wDayOfWeek = (unsigned short)lt.tm_wday; r.wDay = (unsigned short)lt.tm_mday;
+    r.wHour = (unsigned short)lt.tm_hour; r.wMinute = (unsigned short)lt.tm_min;
+    r.wSecond = (unsigned short)lt.tm_sec; r.wMilliseconds = 0;
+#endif
     return r;
 }
 static void CB_OnChange(FPDF_FORMFILLINFO* p) {

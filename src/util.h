@@ -1,6 +1,13 @@
 #pragma once
-// Small helpers shared across the editor: UTF-8 <-> UTF-16, file IO, rects.
+// Small helpers shared across the editor: UTF-8 <-> wide text, file IO, rects.
+// Windows: wchar_t is UTF-16 (like PDFium). Android/Linux: wchar_t is UTF-32,
+// so text is converted at the PDFium boundary (WS / FromUtf16).
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <cstdio>
+#include <unistd.h>
+#endif
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef _WIN32
 inline std::string W2U(const std::wstring& w) {
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -30,6 +38,75 @@ inline const unsigned short* WS(const std::wstring& w) {
     return reinterpret_cast<const unsigned short*>(w.c_str());
 }
 
+// UTF-16 from PDFium -> wstring (n = number of code units, or up to the NUL).
+inline std::wstring FromUtf16(const unsigned short* p, size_t n = (size_t)-1) {
+    if (!p) return {};
+    if (n == (size_t)-1) return std::wstring(reinterpret_cast<const wchar_t*>(p));
+    return std::wstring(reinterpret_cast<const wchar_t*>(p), n);
+}
+#else
+inline std::string W2U(const std::wstring& w) {
+    std::string s;
+    for (wchar_t wc : w) {
+        uint32_t c = (uint32_t)wc;
+        if (c < 0x80) s += (char)c;
+        else if (c < 0x800) { s += (char)(0xC0 | (c >> 6)); s += (char)(0x80 | (c & 0x3F)); }
+        else if (c < 0x10000) { s += (char)(0xE0 | (c >> 12)); s += (char)(0x80 | ((c >> 6) & 0x3F)); s += (char)(0x80 | (c & 0x3F)); }
+        else { s += (char)(0xF0 | (c >> 18)); s += (char)(0x80 | ((c >> 12) & 0x3F)); s += (char)(0x80 | ((c >> 6) & 0x3F)); s += (char)(0x80 | (c & 0x3F)); }
+    }
+    return s;
+}
+
+inline std::wstring U2W(const std::string& s) {
+    std::wstring w;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp;
+        int len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c >> 5) == 6) { cp = c & 0x1F; len = 2; }
+        else if ((c >> 4) == 14) { cp = c & 0x0F; len = 3; }
+        else if ((c >> 3) == 30) { cp = c & 0x07; len = 4; }
+        else { ++i; continue; }
+        if (i + len > s.size()) break;
+        for (int k = 1; k < len; ++k) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        w += (wchar_t)cp;
+        i += len;
+    }
+    return w;
+}
+
+// PDFium speaks UTF-16LE; wchar_t is UTF-32 here, so WS() hands PDFium a
+// converted copy that lives until the end of the full expression (the call).
+struct Utf16Arg {
+    std::u16string s;
+    operator const unsigned short*() const { return reinterpret_cast<const unsigned short*>(s.c_str()); }
+};
+inline Utf16Arg WS(const std::wstring& w) {
+    Utf16Arg a;
+    for (wchar_t wc : w) {
+        uint32_t c = (uint32_t)wc;
+        if (c >= 0x10000) { c -= 0x10000; a.s += (char16_t)(0xD800 + (c >> 10)); a.s += (char16_t)(0xDC00 + (c & 0x3FF)); }
+        else a.s += (char16_t)c;
+    }
+    return a;
+}
+
+inline std::wstring FromUtf16(const unsigned short* p, size_t n = (size_t)-1) {
+    std::wstring w;
+    if (!p) return w;
+    for (size_t i = 0; n == (size_t)-1 ? p[i] != 0 : i < n; ++i) {
+        uint32_t c = p[i];
+        if (c >= 0xD800 && c <= 0xDBFF && (n == (size_t)-1 ? p[i + 1] != 0 : i + 1 < n)) {
+            uint32_t d = p[i + 1];
+            if (d >= 0xDC00 && d <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00); ++i; }
+        }
+        w += (wchar_t)c;
+    }
+    return w;
+}
+#endif
+
 // Reads a PDFium "returns byte length incl. NUL" UTF-16 string getter.
 template <typename F>
 inline std::wstring ReadUtf16(F getter) {
@@ -37,10 +114,10 @@ inline std::wstring ReadUtf16(F getter) {
     if (bytes <= 2) return {};
     std::vector<unsigned short> buf(bytes / 2 + 1, 0);
     getter(buf.data(), bytes);
-    std::wstring w(reinterpret_cast<wchar_t*>(buf.data()));
-    return w;
+    return FromUtf16(buf.data());
 }
 
+#ifdef _WIN32
 inline bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
     FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) return false;
@@ -69,6 +146,31 @@ inline bool WriteFileBytes(const std::wstring& path, const void* data, size_t n)
     }
     return true;
 }
+#else
+inline bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
+    FILE* f = fopen(W2U(path).c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return false; }
+    out.resize((size_t)n);
+    size_t got = n ? fread(out.data(), 1, (size_t)n, f) : 0;
+    fclose(f);
+    return got == (size_t)n;
+}
+
+inline bool WriteFileBytes(const std::wstring& path, const void* data, size_t n) {
+    std::string p = W2U(path), tmp = p + ".tmp~";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    size_t put = n ? fwrite(data, 1, n, f) : 0;
+    bool ok = (put == n) && fflush(f) == 0;
+    fclose(f);
+    if (!ok || rename(tmp.c_str(), p.c_str()) != 0) { unlink(tmp.c_str()); return false; }
+    return true;
+}
+#endif
 
 inline std::wstring FileNameOf(const std::wstring& path) {
     size_t p = path.find_last_of(L"\\/");

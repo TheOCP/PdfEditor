@@ -1,5 +1,9 @@
 #include "sysfonts.h"
+#ifdef _WIN32
 #include <shlobj.h>
+#else
+#include <dirent.h>
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -73,6 +77,7 @@ bool HasBold(const std::string& s) {
 }
 bool HasItalic(const std::string& s) { return s.find("italic") != std::string::npos; }
 
+#ifdef _WIN32
 void ReadFontKey(HKEY root, bool absolutePaths, std::vector<SysFont>& out) {
     HKEY k;
     if (RegOpenKeyExW(root, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts", 0, KEY_READ, &k) != ERROR_SUCCESS)
@@ -106,14 +111,40 @@ void ReadFontKey(HKEY root, bool absolutePaths, std::vector<SysFont>& out) {
     }
     RegCloseKey(k);
 }
+#else
+// Android / Linux: the TrueType files in the system font folders; the name
+// comes from the file ("NotoSerif-BoldItalic.ttf" -> family notoserif, bolditalic).
+void ReadFontDir(const char* dir, std::vector<SysFont>& out) {
+    DIR* d = opendir(dir);
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.size() < 5 || Lower(n.substr(n.size() - 4)) != ".ttf") continue;
+        std::string stem = n.substr(0, n.size() - 4);
+        SysFont f;
+        f.name = stem;
+        for (auto& c : f.name) if (c == '-' || c == '_') c = ' ';
+        f.file = U2W(std::string(dir) + "/" + n);
+        SplitStyle(Lower(NoSpaces(stem)), f.family, f.style);
+        f.style = CanonStyle(f.style);
+        out.push_back(std::move(f));
+    }
+    closedir(d);
+}
+#endif
 
 } // namespace
 
 const std::vector<SysFont>& SystemFonts() {
     static std::vector<SysFont> fonts = [] {
         std::vector<SysFont> v;
+#ifdef _WIN32
         ReadFontKey(HKEY_LOCAL_MACHINE, false, v);
         ReadFontKey(HKEY_CURRENT_USER, true, v);
+#else
+        ReadFontDir("/system/fonts", v);
+        ReadFontDir("/product/fonts", v);
+#endif
         std::sort(v.begin(), v.end(), [](const SysFont& a, const SysFont& b) { return Lower(a.name) < Lower(b.name); });
         v.erase(std::unique(v.begin(), v.end(), [](const SysFont& a, const SysFont& b) { return a.name == b.name; }), v.end());
         return v;
@@ -198,6 +229,21 @@ const SysFont* MatchSystemFont(const std::string& pdfName, bool* exact) {
             family.find("consol") != std::string::npos)
             fb = "couriernew";
         cands = findFamily(fb);
+    }
+    // Systems without the Windows fonts (Android): their own equivalents.
+    if (cands.empty()) {
+        bool serif = family.find("times") != std::string::npos || family.find("serif") != std::string::npos ||
+                     family.find("roman") != std::string::npos || family.find("georgia") != std::string::npos;
+        bool mono = family.find("mono") != std::string::npos || family.find("courier") != std::string::npos ||
+                    family.find("consol") != std::string::npos;
+        const char* chain[4] = { "roboto", "notosans", "droidsans", "opensans" };
+        if (serif) { chain[0] = "notoserif"; chain[1] = "droidserif"; chain[2] = "sourceserif"; chain[3] = "roboto"; }
+        if (mono) { chain[0] = "droidsansmono"; chain[1] = "cutivemono"; chain[2] = "robotomono"; chain[3] = "roboto"; }
+        for (const char* c : chain) {
+            cands = findFamily(c);
+            if (!cands.empty()) break;
+        }
+        if (cands.empty() && !fonts.empty()) cands = { &fonts[0] };
     }
     if (cands.empty()) return nullptr;
     if (exact) *exact = byName;

@@ -44,6 +44,10 @@ static void InsertAt(FPDF_PAGE p, FPDF_PAGEOBJECT o, int index) {
 
 static std::wstring FromUtf32(unsigned int u) {
     std::wstring s;
+    if (sizeof(wchar_t) == 4) {               // Android/Linux: one wchar_t per code point
+        if (u) s += (wchar_t)u;
+        return s;
+    }
     if (u >= 0x10000 && u <= 0x10FFFF) {
         u -= 0x10000;
         s += (wchar_t)(0xD800 + (u >> 10));
@@ -838,7 +842,7 @@ static bool MarkNamed(FPDF_PAGEOBJECTMARK mark, const wchar_t* name) {
     unsigned long n = 0;
     unsigned short buf[32] = { 0 };
     if (!FPDFPageObjMark_GetName(mark, buf, sizeof(buf) - 2, &n)) return false;
-    return std::wstring(reinterpret_cast<wchar_t*>(buf)) == name;
+    return FromUtf16(buf) == name;
 }
 static int PieceId(FPDF_PAGEOBJECT obj, bool* alt = nullptr, bool* ownGroup = nullptr) {
     if (alt) *alt = false;
@@ -2304,7 +2308,7 @@ static bool MarkIsGroup(FPDF_PAGEOBJECTMARK mark) {
     unsigned long n = 0;
     unsigned short buf[32] = { 0 };
     if (!FPDFPageObjMark_GetName(mark, buf, sizeof(buf) - 2, &n)) return false;
-    return std::wstring(reinterpret_cast<wchar_t*>(buf)) == L"PEGroup";
+    return FromUtf16(buf) == L"PEGroup";
 }
 
 int GetGroupId(FPDF_PAGEOBJECT obj) {
@@ -2788,7 +2792,7 @@ std::wstring ExtractText(Document& d, int page) {
     std::vector<unsigned short> buf((size_t)n + 1, 0);
     int got = FPDFText_GetText(t, 0, n, buf.data());
     if (got <= 0) return {};
-    std::wstring s(reinterpret_cast<wchar_t*>(buf.data()), (size_t)got - (buf[got - 1] == 0 ? 1 : 0));
+    std::wstring s = FromUtf16(buf.data(), (size_t)got - (buf[got - 1] == 0 ? 1 : 0));
     for (auto& c : s) if (c == 0xA0) c = L' ';   // fonts often share the space / no-break space glyph
     return s;
 }
@@ -2924,7 +2928,11 @@ bool ExportPagesToImages(Document& d, const std::vector<int>& pages, const std::
         if ((int64_t)w * h > (int64_t)120000000) { err = "page too large at this DPI"; return false; }
         if (!d.Render(i, scale, 0, 0, w, h, buf, true, true)) { err = "render failed"; return false; }
         wchar_t name[64];
+#ifdef _WIN32
         swprintf(name, 64, L"\\page-%03d.png", i + 1);
+#else
+        swprintf(name, 64, L"/page-%03d.png", i + 1);
+#endif
         if (!SaveImageFile(dir + name, buf.data(), w, h, err)) return false;
     }
     return true;

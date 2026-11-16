@@ -431,6 +431,11 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "New document", "Neues Dokument" },
     { "or drop a PDF file here", "oder eine PDF-Datei hierher ziehen" },
 
+    { "Line thickness", "Linienstärke" },
+    { "(%d lines)", "(%d Linien)" },
+    { "Thinner", "Dünner" },
+    { "Thicker", "Dicker" },
+
     // ---- error messages from the editing layer
     { "PDFium could not load this font", "PDFium konnte diese Schrift nicht laden" },
     { "PDFium could not serialize the document", "PDFium konnte das Dokument nicht speichern" },

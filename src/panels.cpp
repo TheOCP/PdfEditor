@@ -414,50 +414,61 @@ void App::DrawThumbnails() {
     }
 }
 
+// ------------------------------------------------------------ line thickness
+
+// "Line thickness" for the selected lines - one line, several, or a whole
+// table grid at once: a slider plus an exact number with - / + steps.
+static void DrawLineThickness(App& a) {
+    std::vector<FPDF_PAGEOBJECT> lines;
+    bool single = a.groupSel.size() <= 1;
+    if (single) {
+        if (ops::ObjectType(a.sel.obj) == FPDF_PAGEOBJ_PATH) lines.push_back(a.sel.obj);
+    } else {
+        for (auto o : a.groupSel)
+            if (ops::ObjectType(o) == FPDF_PAGEOBJ_PATH) lines.push_back(o);
+    }
+    if (lines.empty()) return;
+    float scale = single ? ops::MatrixScale(a.sel.accum) : 1.0f;
+    float cur = 0;
+    for (auto o : lines) cur = std::max(cur, ops::LineThickness(o) * scale);
+    auto apply = [&](float v) {
+        v = std::clamp(v, 0.05f, 100.0f);
+        if (single) a.EnsureSelectionEditable();
+        std::vector<FPDF_PAGEOBJECT> targets = single ? std::vector<FPDF_PAGEOBJECT>{ a.sel.obj } : lines;
+        for (auto o : targets) ops::SetLineThickness(a.doc, a.sel.page, o, v / (single ? ops::MatrixScale(a.sel.accum) : 1.0f));
+        a.InvalidatePage(a.sel.page);
+    };
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(T("Line thickness"));
+    if (lines.size() > 1) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(T("(%d lines)"), (int)lines.size());
+    }
+    float v = cur;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderFloat("##thickSlider", &v, 0.1f, 20.0f, "%.2f pt", ImGuiSliderFlags_Logarithmic)) apply(v);
+    if (ImGui::IsItemDeactivatedAfterEdit()) a.CommitIfDirty("Line thickness");
+
+    const float step = 0.25f;
+    float bw = ImGui::GetFrameHeight() * 1.4f;
+    float sp = ImGui::GetStyle().ItemInnerSpacing.x;
+    if (ImGui::Button("-##thinner", ImVec2(bw, 0))) { apply(std::max(0.05f, cur - step)); a.CommitIfDirty("Line thickness"); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Thinner"));
+    ImGui::SameLine(0, sp);
+    float n = cur;
+    ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x - bw - sp));
+    if (ImGui::InputFloat("##thickValue", &n, 0.0f, 0.0f, "%.2f pt")) apply(n);
+    if (ImGui::IsItemDeactivatedAfterEdit()) a.CommitIfDirty("Line thickness");
+    ImGui::SameLine(0, sp);
+    if (ImGui::Button("+##thicker", ImVec2(bw, 0))) { apply(cur + step); a.CommitIfDirty("Line thickness"); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Thicker"));
+}
+
 // ---------------------------------------------------------------- properties
 
 void App::DrawProperties() {
     float s = dpiScale;
-    if (ImGui::CollapsingHeader(T("New text & shapes##newstyle"), ImGuiTreeNodeFlags_DefaultOpen)) {
-        const auto& fl = FontList();
-        CheckboxWrap(T("New text matches the PDF's font"), &matchNearbyFont);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", T("Uses the font, size and colour of the nearest text."));
-        ImGui::BeginDisabled(matchNearbyFont);
-        ImGui::TextUnformatted(T("Font"));
-        ImGui::SetNextItemWidth(-1);
-        const char* cur = (fontIndex >= 0 && fontIndex < (int)fl.size()) ? fl[fontIndex].label.c_str() : T("(none)");
-        if (ImGui::BeginCombo("##font", cur)) {
-            for (int i = 0; i < (int)fl.size(); ++i) {
-                bool on = (i == fontIndex);
-                if (i == docFontCount && docFontCount > 0) ImGui::Separator();
-                if (ImGui::Selectable(fl[i].label.c_str(), on)) fontIndex = i;
-                if (on) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::SetNextItemWidth(-1);
-        ImGui::DragFloat("##size", &fontSize, 0.2f, 4.0f, 300.0f, T("Size %.1f pt"));
-        ImGui::EndDisabled();
-        ImGui::ColorEdit4(T("Fill / text colour##fill"), fillColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
-        ImGui::ColorEdit4(T("Outline colour##stroke"), strokeColor, ImGuiColorEditFlags_NoInputs);
-        {
-            FlowRow row(ImGui::GetStyle().ItemSpacing.x);
-            float cb = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
-            const char* fillLbl = T("Filled");
-            const char* outLbl = T("Outlined");
-            row.Before(cb + ImGui::CalcTextSize(fillLbl).x);
-            ImGui::Checkbox(fillLbl, &rectFilled);
-            row.After();
-            row.Before(cb + ImGui::CalcTextSize(outLbl).x);
-            ImGui::Checkbox(outLbl, &rectStroked);
-            row.After();
-        }
-        ImGui::SetNextItemWidth(std::min(120 * s, ImGui::GetContentRegionAvail().x * 0.45f));
-        ImGui::DragFloat(T("Line width##lw"), &strokeWidth, 0.1f, 0.2f, 20.0f, "%.1f");
-    }
-
-    ImGui::Spacing();
     if (ImGui::CollapsingHeader(T("Selection##sel"), ImGuiTreeNodeFlags_DefaultOpen)) {
         float xyW = std::min(90 * s, (ImGui::GetContentRegionAvail().x - 60 * s) * 0.5f);
         if (AnnotSelected()) {
@@ -481,6 +492,7 @@ void App::DrawProperties() {
             bool ye = ImGui::IsItemDeactivatedAfterEdit();
             if (xe || ye) { MoveSelection(left - b.l, bottom - b.b); CommitIfDirty("Move group"); }
             ImGui::TextWrapped(T("Size: %.1f x %.1f pt"), b.W(), b.H());
+            DrawLineThickness(*this);
             ImGui::Separator();
             FlowRow row(ImGui::GetStyle().ItemSpacing.x);
             if (selGroupId) { if (row.Button(T("Ungroup"))) UngroupSelection(); }
@@ -574,15 +586,7 @@ void App::DrawProperties() {
 
             if (t == FPDF_PAGEOBJ_PATH) {
                 ops::StrokeProps st = ops::ReadStroke(sel.obj);
-                ImGui::Separator();
-                float lw = ops::LineThickness(sel.obj) * ops::MatrixScale(sel.accum);
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::DragFloat("##thick", &lw, 0.05f, 0.1f, 60.0f, T("Thickness %.2f pt"))) {
-                    EnsureSelectionEditable();
-                    ops::SetLineThickness(doc, sel.page, sel.obj, lw);
-                    InvalidatePage(sel.page);
-                }
-                if (ImGui::IsItemDeactivatedAfterEdit()) CommitIfDirty("Line thickness");
+                DrawLineThickness(*this);
                 float lc[3] = { st.r / 255.0f, st.g / 255.0f, st.b / 255.0f };
                 if (ImGui::ColorEdit3(T("Line colour##lc"), lc, ImGuiColorEditFlags_NoInputs)) {
                     EnsureSelectionEditable();
@@ -604,6 +608,46 @@ void App::DrawProperties() {
             if (row.Button(T("Copy"))) CopySelection();
             if (row.Button(T("Delete"))) DeleteSelection();
         }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader(T("New text & shapes##newstyle"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        const auto& fl = FontList();
+        CheckboxWrap(T("New text matches the PDF's font"), &matchNearbyFont);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", T("Uses the font, size and colour of the nearest text."));
+        ImGui::BeginDisabled(matchNearbyFont);
+        ImGui::TextUnformatted(T("Font"));
+        ImGui::SetNextItemWidth(-1);
+        const char* cur = (fontIndex >= 0 && fontIndex < (int)fl.size()) ? fl[fontIndex].label.c_str() : T("(none)");
+        if (ImGui::BeginCombo("##font", cur)) {
+            for (int i = 0; i < (int)fl.size(); ++i) {
+                bool on = (i == fontIndex);
+                if (i == docFontCount && docFontCount > 0) ImGui::Separator();
+                if (ImGui::Selectable(fl[i].label.c_str(), on)) fontIndex = i;
+                if (on) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(-1);
+        ImGui::DragFloat("##size", &fontSize, 0.2f, 4.0f, 300.0f, T("Size %.1f pt"));
+        ImGui::EndDisabled();
+        ImGui::ColorEdit4(T("Fill / text colour##fill"), fillColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+        ImGui::ColorEdit4(T("Outline colour##stroke"), strokeColor, ImGuiColorEditFlags_NoInputs);
+        {
+            FlowRow row(ImGui::GetStyle().ItemSpacing.x);
+            float cb = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
+            const char* fillLbl = T("Filled");
+            const char* outLbl = T("Outlined");
+            row.Before(cb + ImGui::CalcTextSize(fillLbl).x);
+            ImGui::Checkbox(fillLbl, &rectFilled);
+            row.After();
+            row.Before(cb + ImGui::CalcTextSize(outLbl).x);
+            ImGui::Checkbox(outLbl, &rectStroked);
+            row.After();
+        }
+        ImGui::SetNextItemWidth(std::min(120 * s, ImGui::GetContentRegionAvail().x * 0.45f));
+        ImGui::DragFloat(T("Line width##lw"), &strokeWidth, 0.1f, 0.2f, 20.0f, "%.1f");
     }
 
     ImGui::Spacing();

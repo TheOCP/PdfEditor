@@ -151,7 +151,7 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
     const Cfg cfgs[] = { { 1280, 720, 1.0f }, { 1280, 720, 1.5f }, { 1920, 1080, 1.0f }, { 1920, 1080, 1.5f },
                          { 2560, 1440, 1.0f }, { 3840, 2160, 2.0f }, { 1024, 700, 1.0f } };
     const char* states[] = { "welcome", "main", "text", "group", "toast", "help", "settings", "table", "meta",
-                             "about", "import", "edit", "password" };
+                             "about", "import", "edit", "password", "line", "lines" };
     SetUiScaleSetting(1.0f);
     for (int li = 0; li < 2; ++li) {
         g_app.ChangeLanguage(li ? Lang::German : Lang::English, false);   // never saved
@@ -199,6 +199,22 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
                 else if (name == "about") g_app.showAbout = true;
                 else if (name == "import") { g_app.importFile = L"C:\\Users\\Name\\Documents\\Another document.pdf"; g_app.showImport = true; }
                 else if (name == "edit" && firstText) g_app.BeginEditText(0, firstText);
+                else if (name == "line" || name == "lines") {
+                    // A blank page with a table grid: one line / every line selected.
+                    g_app.doc.CreateBlank(595, 842);
+                    g_app.cache.clear();
+                    g_app.thumbs.clear();
+                    ops::AddTable(g_app.doc, 0, PRect{ 60, 500, 535, 780 }, 4, 3, true, 24, 0, 0, 0, 0.5f);
+                    g_app.doc.Commit("table");
+                    if (name == "lines") {
+                        g_app.SelectAllOnPage(true);
+                    } else {
+                        for (auto& o : ops::ListObjects(g_app.doc, 0))
+                            if (o.type == FPDF_PAGEOBJ_PATH) { g_app.sel.Set(g_app.doc, 0, o); g_app.groupSel = { o.obj }; break; }
+                    }
+                    g_app.toast.text.clear();
+                    g_app.fitPending = true;
+                }
                 else if (name == "password") {
                     g_app.pwFile = L"x.pdf";
                     g_app.pwError = "Wrong password, try again.";
