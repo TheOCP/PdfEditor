@@ -58,6 +58,8 @@ public:
     Load LoadFile(const std::wstring& file, const std::string& pw, std::string& err);
     Load LoadBytes(BytesPtr bytes, const std::string& pw, std::string& err);
     bool CreateBlank(float widthPt, float heightPt);
+    // Releases the PDFium document now (must happen before FPDF_DestroyLibrary).
+    void Close() { CloseDocument(); }
 
     // Writes the document. FPDF_NO_INCREMENTAL by default (clean rewrite).
     bool SaveFile(const std::wstring& file, bool removeSecurity, bool incremental, std::string& err);

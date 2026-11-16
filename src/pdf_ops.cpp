@@ -451,14 +451,57 @@ float VisualFontSize(FPDF_PAGEOBJECT text) {
     return sz * MatrixScale(ObjMatrix(text));
 }
 
+// The text a text object really contains. PDFium's text layer inserts
+// "generated" spaces wherever glyphs are spaced apart; for letter-spaced or
+// individually positioned text that means a space between every letter, and
+// writing those back made edited text twice as wide. Keep only real
+// characters, plus generated spaces that look like word gaps (not uniform
+// letter spacing) and sit between real characters.
 static std::wstring TextOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
     FPDF_TEXTPAGE tp = d.TextPage(page);
-    if (!tp) return {};
-    unsigned long bytes = FPDFTextObj_GetText(obj, tp, nullptr, 0);
-    if (bytes < 2) return {};
-    std::vector<unsigned short> buf(bytes / 2 + 1, 0);
-    FPDFTextObj_GetText(obj, tp, buf.data(), bytes);
-    return std::wstring(reinterpret_cast<wchar_t*>(buf.data()));
+    if (!tp || !obj) return {};
+    std::vector<std::pair<unsigned, bool>> cs;      // (unicode, generated)
+    int n = FPDFText_CountChars(tp);
+    for (int i = 0; i < n; ++i) {
+        if (FPDFText_GetTextObject(tp, i) != obj) continue;
+        cs.push_back({ FPDFText_GetUnicode(tp, i), FPDFText_IsGenerated(tp, i) == 1 });
+    }
+    int lastReal = -1, real = 0, genGaps = 0;
+    for (int k = 0; k < (int)cs.size(); ++k)
+        if (!cs[k].second) { lastReal = k; ++real; }
+    for (int k = 0; k < lastReal; ++k)
+        if (cs[k].second && cs[k].first == L' ') ++genGaps;
+    bool letterSpaced = genGaps > 0 && genGaps * 10 >= std::max(1, real - 1) * 4;
+    std::wstring s;
+    for (int k = 0; k < (int)cs.size(); ++k) {
+        if (!cs[k].second) s += FromUtf32(cs[k].first);
+        else if (!letterSpaced && k < lastReal && cs[k].first == L' ' && !s.empty() && s.back() != L' ') s += L' ';
+    }
+    return s;
+}
+
+// Scale (kx, ky) that makes `alt` draw `sample` in the same box as `ref` does,
+// so a stand-in font can't look bigger, smaller, wider or narrower.
+static void MatchFontMetrics(Document& d, FPDF_FONT ref, FPDF_FONT alt, float tf, const std::wstring& sample,
+                             float& kx, float& ky) {
+    kx = ky = 1.0f;
+    if (!ref || !alt || ref == alt || tf <= 0) return;
+    std::wstring s;
+    for (wchar_t c : sample) if (!iswspace(c)) s += c;
+    if (s.empty()) return;
+    auto box = [&](FPDF_FONT f, PRect& r) {
+        FPDF_PAGEOBJECT t = FPDFPageObj_CreateTextObj(d.Raw(), f, tf);
+        if (!t) return false;
+        bool ok = FPDFText_SetText(t, WS(s)) != 0;
+        if (ok) r = ObjectBounds(t);
+        FPDFPageObj_Destroy(t);
+        return ok && r.W() > 0.05f && r.H() > 0.05f;
+    };
+    PRect a, b;
+    if (box(ref, a) && box(alt, b)) {
+        kx = std::clamp(a.W() / b.W(), 0.4f, 2.5f);
+        ky = std::clamp(a.H() / b.H(), 0.4f, 2.5f);
+    }
 }
 
 TextProps ReadText(Document& d, int page, FPDF_PAGEOBJECT obj) {
@@ -555,19 +598,25 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
     int render = FPDFTextObj_GetTextRenderMode(obj);
     std::string base = BaseFontOf(obj);
     int gid = GetGroupId(obj);
-    bool verifiable = !TextOf(d, page, obj).empty();   // text layer can see this object
+    FPDF_FONT refFont = FPDFTextObj_GetFont(obj);
+    std::wstring orig = TextOf(d, page, obj);
+    bool verifiable = !orig.empty();                    // the text layer can see this object
 
     if (FPDFText_SetText(obj, WS(text)) && (!verifiable || CharsRoundTrip(d, page, obj, text))) {
         d.ContentChanged(page);
         return true;
     }
-    // The PDF's font can't show what was typed: same size/rotation/spot, full font.
+    // The PDF's font can't show what was typed. Use the closest installed font,
+    // scaled so the original text would fill exactly the same box -> same size.
     FPDF_FONT f = LoadFontFor(d, {}, base, true);
     if (!f) return false;
     FPDF_PAGEOBJECT repl = FPDFPageObj_CreateTextObj(d.Raw(), f, tf);
     if (!repl) return false;
     if (!FPDFText_SetText(repl, WS(text))) { FPDFPageObj_Destroy(repl); return false; }
-    FPDFPageObj_SetMatrix(repl, &m);
+    float kx = 1, ky = 1;
+    MatchFontMetrics(d, refFont, f, tf, orig, kx, ky);
+    FS_MATRIX scaled = MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, m);
+    FPDFPageObj_SetMatrix(repl, &scaled);
     FPDFPageObj_SetFillColor(repl, fr, fg, fb, fa);
     FPDFPageObj_SetStrokeColor(repl, sr, sg, sb, sa);
     if (render >= 0) FPDFTextObj_SetTextRenderMode(repl, (FPDF_TEXT_RENDERMODE)render);
@@ -615,24 +664,28 @@ FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPD
     FPDF_PAGE p = d.Page(page);
     if (!p) { err = "page not loaded"; return nullptr; }
     if (text.empty()) { err = "empty text"; return nullptr; }
-    auto make = [&](FPDF_FONT font) -> FPDF_PAGEOBJECT {
+    auto make = [&](FPDF_FONT font, float kx, float ky) -> FPDF_PAGEOBJECT {
         if (!font) return nullptr;
         FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(d.Raw(), font, (float)visualSize);
         if (!o) return nullptr;
         if (!FPDFText_SetText(o, WS(text))) { FPDFPageObj_Destroy(o); return nullptr; }
         FPDFPageObj_SetFillColor(o, r, g, b, 255);
-        FPDFPageObj_Transform(o, 1, 0, 0, 1, px, py);
+        FPDFPageObj_Transform(o, kx, 0, 0, ky, px, py);
         FPDFPage_InsertObject(p, o);
         return o;
     };
-    FPDF_FONT f = (styleFrom && FPDFPageObj_GetType(styleFrom) == FPDF_PAGEOBJ_TEXT) ? FPDFTextObj_GetFont(styleFrom) : nullptr;
+    bool live = styleFrom && FPDFPageObj_GetType(styleFrom) == FPDF_PAGEOBJ_TEXT;
+    FPDF_FONT f = live ? FPDFTextObj_GetFont(styleFrom) : nullptr;
     if (!f) f = LoadFontFor(d, fontData, fontBase);
-    FPDF_PAGEOBJECT o = make(f);
+    FPDF_PAGEOBJECT o = make(f, 1, 1);
     // The neighbour's font is often a subset; if it lacks a typed letter, use the
-    // same family from the installed fonts instead of showing gaps.
+    // same family from the installed fonts, scaled to the neighbour's glyph size.
     if (o && !CharsRoundTrip(d, page, o, text)) {
         if (FPDFPage_RemoveObject(p, o)) FPDFPageObj_Destroy(o);
-        o = make(LoadFontFor(d, {}, fontBase, true));
+        FPDF_FONT alt = LoadFontFor(d, {}, fontBase, true);
+        float kx = 1, ky = 1;
+        if (live) MatchFontMetrics(d, f, alt, (float)visualSize, TextOf(d, page, styleFrom), kx, ky);
+        o = make(alt, kx, ky);
     }
     if (!o) { err = "could not create the text"; return nullptr; }
     d.ContentChanged(page);
@@ -1259,6 +1312,19 @@ FPDF_PAGEOBJECT PasteObject(Document& d, int page, const ClipObject& c, float dx
             o = build(LoadFontFor(d, {}, c.fontBase, true));
         }
         if (!o) { err = "could not recreate the text"; return nullptr; }
+        // Without the original font object, make the copy occupy the original's
+        // exact box so it can't come out bigger or smaller.
+        if (!live && c.matrix.b == 0 && c.matrix.c == 0 && c.bounds.W() > 0.5f && c.bounds.H() > 0.5f) {
+            PRect nb = ObjectBounds(o);
+            if (nb.W() > 0.5f && nb.H() > 0.5f) {
+                float kx = std::clamp(c.bounds.W() / nb.W(), 0.4f, 2.5f);
+                float ky = std::clamp(c.bounds.H() / nb.H(), 0.4f, 2.5f);
+                if (std::fabs(kx - 1) > 0.02f || std::fabs(ky - 1) > 0.02f) {
+                    FS_MATRIX sm = MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, m);
+                    FPDFPageObj_SetMatrix(o, &sm);
+                }
+            }
+        }
     } else {
         if (c.type == FPDF_PAGEOBJ_PATH) {
             o = BuildPath(ParseSegs(c.segs));

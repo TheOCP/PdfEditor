@@ -17,6 +17,7 @@ void App::Shutdown() {
     ClearLimbo();           // cut objects must be freed while their document still exists
     cache.clear();
     thumbs.clear();
+    doc.Close();            // before PdfShutdown(); the static App would otherwise close it too late
 }
 
 const std::vector<FontChoice>& App::FontList() {
