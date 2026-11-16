@@ -457,20 +457,38 @@ float VisualFontSize(FPDF_PAGEOBJECT text) {
 // writing those back made edited text twice as wide. Keep only real
 // characters, plus generated spaces that look like word gaps (not uniform
 // letter spacing) and sit between real characters.
-static std::wstring TextOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
+// One character of a text object as the text layer sees it.
+struct Glyph {
+    unsigned u = 0;
+    float x = 0;      // page x of its origin
+    float w = 0;      // its own advance (font width only, no extra spacing)
+    bool gen = false; // a word gap the text layer inferred (no glyph in the PDF)
+};
+
+static std::vector<Glyph> GlyphsOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
+    std::vector<Glyph> cs, out;
     FPDF_TEXTPAGE tp = d.TextPage(page);
-    if (!tp || !obj) return {};
-    std::vector<std::pair<unsigned, bool>> cs;      // (unicode, generated)
+    if (!tp || !obj) return out;
     int n = FPDFText_CountChars(tp);
     for (int i = 0; i < n; ++i) {
         if (FPDFText_GetTextObject(tp, i) != obj) continue;
-        cs.push_back({ FPDFText_GetUnicode(tp, i), FPDFText_IsGenerated(tp, i) == 1 });
+        Glyph g;
+        g.u = FPDFText_GetUnicode(tp, i);
+        // Fonts often share one glyph between space and no-break space, so a typed
+        // space can read back as U+00A0 (or another Unicode space): it's a space.
+        if (g.u == 0xA0 || (g.u >= 0x2000 && g.u <= 0x200A) || g.u == 0x202F || g.u == 0x3000) g.u = ' ';
+        g.gen = FPDFText_IsGenerated(tp, i) == 1;
+        double ox = 0, oy = 0;
+        if (FPDFText_GetCharOrigin(tp, i, &ox, &oy)) g.x = (float)ox;
+        FS_RECTF r;
+        if (!g.gen && FPDFText_GetLooseCharBox(tp, i, &r)) g.w = std::fabs(r.right - r.left);
+        cs.push_back(g);
     }
     int lastReal = -1, real = 0, genGaps = 0;
     for (int k = 0; k < (int)cs.size(); ++k)
-        if (!cs[k].second) { lastReal = k; ++real; }
+        if (!cs[k].gen) { lastReal = k; ++real; }
     for (int k = 0; k < lastReal; ++k)
-        if (cs[k].second && cs[k].first == L' ') ++genGaps;
+        if (cs[k].gen && cs[k].u == L' ') ++genGaps;
     bool letterSpaced = genGaps > 0 && genGaps * 10 >= std::max(1, real - 1) * 4;
     // Dates and amounts ("12.01.2026", "1.234,56") never have word gaps next to
     // punctuation; a generated space there is just spacing in the PDF's layout.
@@ -478,15 +496,23 @@ static std::wstring TextOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
         return u == '.' || u == ',' || u == ':' || u == ';' || u == '/' || u == '-' || u == '(' || u == ')' ||
                u == '\'' || u == '%' || u == 0x20AC;
     };
-    std::wstring s;
     for (int k = 0; k < (int)cs.size(); ++k) {
-        if (!cs[k].second) { s += FromUtf32(cs[k].first); continue; }
-        if (letterSpaced || k >= lastReal || cs[k].first != L' ' || s.empty() || s.back() == L' ') continue;
-        unsigned next = 0;
-        for (int j = k + 1; j < (int)cs.size(); ++j) if (!cs[j].second) { next = cs[j].first; break; }
-        if (punct((unsigned)s.back()) || punct(next)) continue;
-        s += L' ';
+        if (!cs[k].gen) { out.push_back(cs[k]); continue; }
+        if (letterSpaced || k >= lastReal || cs[k].u != L' ' || out.empty() || out.back().u == L' ') continue;
+        int nx = -1;
+        for (int j = k + 1; j < (int)cs.size(); ++j) if (!cs[j].gen) { nx = j; break; }
+        if (nx < 0 || punct(out.back().u) || punct(cs[nx].u)) continue;
+        Glyph g = cs[k];                       // the gap: from the previous glyph's end to the next glyph
+        g.x = out.back().x + out.back().w;
+        g.w = std::max(0.0f, cs[nx].x - g.x);
+        out.push_back(g);
     }
+    return out;
+}
+
+static std::wstring TextOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
+    std::wstring s;
+    for (const Glyph& g : GlyphsOf(d, page, obj)) s += FromUtf32(g.u);
     return s;
 }
 
@@ -721,13 +747,33 @@ static void ClearPieceMark(FPDF_PAGEOBJECT obj) {
         if (m && MarkNamed(m, L"PEText")) FPDFPageObj_RemoveMark(obj, m);
     }
 }
-static void SetPieceMark(Document& d, FPDF_PAGEOBJECT obj, int id, bool alt, bool ownGroup) {
+// A stand-in character is centred in the slot of the character it replaced;
+// the slot (page x and width, in 1/100 pt) is remembered so editing again
+// lines up with the original grid, not with the stand-in glyph.
+static void SetPieceMark(Document& d, FPDF_PAGEOBJECT obj, int id, bool alt, bool ownGroup,
+                         float slotX = NAN, float slotW = 0) {
     ClearPieceMark(obj);
     FPDF_PAGEOBJECTMARK m = FPDFPageObj_AddMark(obj, "PEText");
     if (!m) return;
     FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "id", id);
     FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "alt", alt ? 1 : 0);
     FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "grp", ownGroup ? 1 : 0);
+    if (!std::isnan(slotX)) {
+        FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "sx", (int)std::lround(slotX * 100));
+        FPDFPageObjMark_SetIntParam(d.Raw(), obj, m, "sw", (int)std::lround(slotW * 100));
+    }
+}
+static bool PieceSlot(FPDF_PAGEOBJECT obj, float& slotX, float& slotW) {
+    for (int i = 0, n = FPDFPageObj_CountMarks(obj); i < n; ++i) {
+        FPDF_PAGEOBJECTMARK m = FPDFPageObj_GetMark(obj, (unsigned long)i);
+        if (!m || !MarkNamed(m, L"PEText")) continue;
+        int sx = 0, sw = 0;
+        if (!FPDFPageObjMark_GetParamIntValue(m, "sx", &sx) || !FPDFPageObjMark_GetParamIntValue(m, "sw", &sw)) return false;
+        slotX = sx / 100.0f;
+        slotW = sw / 100.0f;
+        return true;
+    }
+    return false;
 }
 static int MaxPieceId(Document& d) {
     int mx = 0;
@@ -735,6 +781,27 @@ static int MaxPieceId(Document& d) {
         if (FPDF_PAGE p = d.Page(pg))
             for (int i = 0, n = FPDFPage_CountObjects(p); i < n; ++i) mx = std::max(mx, PieceId(FPDFPage_GetObject(p, i)));
     return mx;
+}
+
+// Ties the pieces of one text together: a shared group (so they move as one)
+// and a piece tag (so they edit as one). A single piece just keeps `groupId`.
+static void TagPieces(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& out,
+                      const std::vector<bool>& isAlt, int groupId,
+                      const std::vector<std::pair<float, float>>* slots = nullptr) {
+    if (out.size() == 1) {
+        if (groupId) SetGroupId(d, page, out[0], groupId);
+    } else if (out.size() > 1) {
+        bool own = groupId == 0;
+        int gid = own ? MaxGroupId(d) + 1 : groupId;
+        int pid = MaxPieceId(d) + 1;
+        for (size_t i = 0; i < out.size(); ++i) {
+            SetGroupId(d, page, out[i], gid);
+            float sx = NAN, sw = 0;
+            if (slots && i < slots->size()) { sx = (*slots)[i].first; sw = (*slots)[i].second; }
+            SetPieceMark(d, out[i], pid, i < isAlt.size() && isAlt[i], own, sx, sw);
+        }
+    }
+    d.ContentChanged(page);
 }
 
 // Many PDFs store a separate copy ("subset") of the same font per page, each
@@ -806,16 +873,170 @@ static std::vector<FPDF_PAGEOBJECT> PlacePieces(Document& d, int page, FPDF_PAGE
         if (i + 1 < runs.size()) x = AdvanceEnd(d, page, o);
     }
     if (reuse && FPDFPage_RemoveObject(p, reuse)) FPDFPageObj_Destroy(reuse);
-    if (out.size() > 1) {
-        bool own = groupId == 0;
-        int gid = own ? MaxGroupId(d) + 1 : groupId;
-        int pid = MaxPieceId(d) + 1;
-        for (size_t i = 0; i < out.size(); ++i) {
-            SetGroupId(d, page, out[i], gid);
-            SetPieceMark(d, out[i], pid, isAlt[i], own);
+    TagPieces(d, page, out, isAlt, groupId);
+    return out;
+}
+
+// Natural advance (page units) of each character of `s` (no spaces) drawn in
+// `f` with matrix `m`, read from the text layer. Empty if it can't be measured.
+static std::vector<float> MeasureAdvances(Document& d, int page, FPDF_FONT f, const TextLook& lk,
+                                          const FS_MATRIX& m, const std::wstring& s) {
+    std::vector<float> w;
+    if (s.empty()) return w;
+    FPDF_PAGE p = d.Page(page);
+    FPDF_PAGEOBJECT t = p ? NewTextObj(d, f, lk, m, s) : nullptr;
+    if (!t) return w;
+    FPDFPage_InsertObject(p, t);
+    d.ContentChanged(page);
+    if (FPDF_TEXTPAGE tp = d.TextPage(page))
+        for (int i = 0, n = FPDFText_CountChars(tp); i < n; ++i) {
+            if (FPDFText_GetTextObject(tp, i) != t || FPDFText_IsGenerated(tp, i) == 1) continue;
+            FS_RECTF r;
+            w.push_back(FPDFText_GetLooseCharBox(tp, i, &r) ? std::fabs(r.right - r.left) : 0.0f);
+        }
+    if (FPDFPage_RemoveObject(p, t)) FPDFPageObj_Destroy(t);
+    d.ContentChanged(page);
+    if (w.size() != s.size()) w.clear();
+    return w;
+}
+
+// Lays the edited text out glyph by glyph like the original, whose characters
+// sat at `O`. PDFs (bank statements especially) often place every character
+// at an exact position - digits on a grid, dots pulled tight, word gaps made by
+// positioning - and re-typing text throws those positions away, so it grew,
+// got gaps around dots and ran into the next column. Unchanged characters keep
+// their exact spacing; changed ones use their own width plus the spacing the
+// original had there. `cur` (on the page, in `font`) shows the text now. If its
+// own layout already matches it is kept as is; otherwise it is replaced by
+// pieces at the right positions - `font` for every character it has, `alt`
+// (scaled kx, ky, centred in the slot) for the `missing` ones.
+// handled=false if it couldn't be measured; the caller then falls back.
+static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PAGEOBJECT cur, FPDF_FONT font,
+                                                  const std::vector<Glyph>& O, const std::wstring& text,
+                                                  const std::wstring& missing, FPDF_FONT alt, float kx, float ky,
+                                                  const TextLook& lk, int groupId, bool& handled) {
+    handled = false;
+    std::vector<FPDF_PAGEOBJECT> out;
+    FPDF_PAGE p = d.Page(page);
+    int n = (int)text.size(), mo = (int)O.size();
+    if (!p || !cur || n == 0 || mo == 0 || !Upright(lk.m)) return out;
+    for (wchar_t c : text) if (c >= 0xD800 && c <= 0xDFFF) return out;
+    for (const Glyph& g : O) if (g.u > 0xFFFF) return out;
+    float em = lk.tf * lk.m.a;                              // one em in page units
+    float tol = std::max(0.15f, 0.025f * em);
+    auto isMissing = [&](wchar_t c) { return !iswspace(c) && missing.find(c) != std::wstring::npos; };
+
+    // Which original character each typed one stands in for.
+    std::vector<int> match(n, -1);
+    if (n == mo) {
+        for (int j = 0; j < n; ++j) match[j] = j;
+    } else {
+        int L = 0, S = 0;
+        while (L < n && L < mo && text[L] == (wchar_t)O[L].u) ++L;
+        while (S < n - L && S < mo - L && text[n - 1 - S] == (wchar_t)O[mo - 1 - S].u) ++S;
+        for (int j = 0; j < L; ++j) match[j] = j;
+        for (int k = 0; k < S; ++k) match[n - 1 - k] = mo - 1 - k;
+    }
+    // Extra spacing the original had after each character (letter spacing,
+    // kerning, positioning); the typical value is used where nothing matches.
+    std::vector<float> E(mo, 0.0f), es;
+    for (int i = 0; i + 1 < mo; ++i) {
+        E[i] = O[i + 1].x - O[i].x - O[i].w;
+        if (!O[i].gen && !O[i + 1].gen && O[i].u != ' ' && O[i + 1].u != ' ') es.push_back(E[i]);
+    }
+    float eTyp = 0;
+    if (!es.empty()) {
+        std::nth_element(es.begin(), es.begin() + es.size() / 2, es.end());
+        eTyp = es[es.size() / 2];
+    }
+
+    // Natural widths of the typed characters that aren't the original ones.
+    auto same = [&](int j) { int i = match[j]; return i >= 0 && (wchar_t)O[i].u == text[j] && !isMissing(text[j]); };
+    std::wstring ownS, altS;
+    for (int j = 0; j < n; ++j) {
+        if (iswspace(text[j]) || same(j)) continue;
+        (isMissing(text[j]) ? altS : ownS) += text[j];
+    }
+    FS_MATRIX am = MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, lk.m);
+    std::vector<float> ownW = MeasureAdvances(d, page, font, lk, lk.m, ownS);
+    std::vector<float> altW = altS.empty() ? std::vector<float>{} : MeasureAdvances(d, page, alt, lk, am, altS);
+    if (ownW.size() != ownS.size() || altW.size() != altS.size()) return out;
+
+    std::vector<float> adv(n, 0.0f), off(n, 0.0f), x(n, 0.0f);
+    size_t oi = 0, ai = 0;
+    for (int j = 0; j < n; ++j) {
+        wchar_t c = text[j];
+        int i = match[j];
+        if (iswspace(c)) adv[j] = (i >= 0 && O[i].u == ' ') ? O[i].w : 0.28f * em;
+        else if (same(j)) adv[j] = O[i].w;
+        else if (isMissing(c)) {
+            float aw = altW[ai++];
+            bool digits = i >= 0 && iswdigit((wchar_t)O[i].u) && iswdigit(c);   // keep the digit grid
+            adv[j] = digits ? O[i].w : aw;
+            off[j] = (adv[j] - aw) * 0.5f;
+        } else adv[j] = ownW[oi++];
+    }
+    x[0] = O[0].x;
+    for (int j = 0; j + 1 < n; ++j) {
+        int i = match[j];
+        float gap = (i >= 0 && i + 1 < mo && match[j + 1] == i + 1) ? E[i] : eTyp;
+        x[j + 1] = x[j] + adv[j] + gap;
+    }
+
+    // Nothing missing and the object already lands every character there: keep it.
+    if (missing.empty()) {
+        std::vector<float> px;
+        for (const Glyph& g : GlyphsOf(d, page, cur)) if (!g.gen && g.u != ' ') px.push_back(g.x);
+        std::vector<float> want;
+        for (int j = 0; j < n; ++j) if (!iswspace(text[j])) want.push_back(x[j]);
+        if (px.size() != want.size()) return out;         // can't compare: leave it alone
+        float dev = 0;
+        for (size_t k = 0; k < px.size(); ++k) dev = std::max(dev, std::fabs(px[k] - want[k]));
+        if (dev <= tol) { handled = true; return { cur }; }
+    }
+
+    // Pieces: a new piece wherever natural spacing can't reach the right spot.
+    struct Run { std::wstring s; bool alt; float x; float slotX, slotW; };
+    std::vector<Run> runs;
+    float runEnd = 0;
+    bool open = false;
+    for (int j = 0; j < n; ++j) {
+        wchar_t c = text[j];
+        if (iswspace(c)) { open = false; continue; }     // spaces are just room, never drawn
+        bool a = isMissing(c);
+        if (open && !a && !runs.back().alt && std::fabs(x[j] - runEnd) <= tol * 0.5f) {
+            runs.back().s += c;
+            runEnd += adv[j];
+        } else {
+            runs.push_back({ std::wstring(1, c), a, x[j] + (a ? off[j] : 0.0f), a ? x[j] : NAN, a ? adv[j] : 0.0f });
+            runEnd = x[j] + adv[j];
+            open = true;
         }
     }
-    d.ContentChanged(page);
+    std::vector<std::pair<float, float>> slots;
+    for (const Run& r : runs) slots.push_back({ r.slotX, r.slotW });
+    std::vector<bool> isAlt;
+    FPDF_PAGEOBJECT anchor = cur;
+    for (const Run& r : runs) {
+        FS_MATRIX mm = r.alt ? am : lk.m;
+        mm.e = r.x;
+        mm.f = lk.m.f;
+        FPDF_PAGEOBJECT o = NewTextObj(d, r.alt ? alt : font, lk, mm, r.s);
+        if (!o) {
+            for (FPDF_PAGEOBJECT q : out) if (FPDFPage_RemoveObject(p, q)) FPDFPageObj_Destroy(q);
+            d.ContentChanged(page);
+            return {};
+        }
+        int idx = TopIndex(p, anchor);
+        InsertAt(p, o, idx >= 0 ? idx + 1 : -1);
+        anchor = o;
+        out.push_back(o);
+        isAlt.push_back(r.alt);
+    }
+    if (out.empty()) return out;
+    if (FPDFPage_RemoveObject(p, cur)) FPDFPageObj_Destroy(cur);
+    TagPieces(d, page, out, isAlt, groupId, &slots);
+    handled = true;
     return out;
 }
 
@@ -833,25 +1054,40 @@ std::vector<FPDF_PAGEOBJECT> TextPieces(Document& d, int page, FPDF_PAGEOBJECT o
     return v;
 }
 
-FPDF_PAGEOBJECT JoinTextPieces(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& pieces) {
-    FPDF_PAGE p = d.Page(page);
-    if (!p || pieces.empty()) return nullptr;
-    FPDF_PAGEOBJECT base = pieces[0];
+// All glyphs of a text drawn in pieces, left to right. Spaces are room between
+// pieces (never drawn), so a wide gap between two pieces reads as a space.
+static std::vector<Glyph> PieceGlyphs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& pieces) {
+    std::vector<Glyph> all;
     for (FPDF_PAGEOBJECT o : pieces) {
-        bool alt = true;
-        PieceId(o, &alt);
-        if (!alt) { base = o; break; }
+        std::vector<Glyph> g = GlyphsOf(d, page, o);
+        if (g.empty()) continue;
+        float sx = 0, sw = 0;
+        if (g.size() == 1 && PieceSlot(o, sx, sw)) { g[0].x = sx; g[0].w = sw; }   // a stand-in: its slot
+        if (!all.empty() && all.back().u != ' ') {
+            float tf = 12;
+            FPDFTextObj_GetFontSize(o, &tf);
+            float em = tf * std::fabs(ObjMatrix(o).d);
+            float end = all.back().x + all.back().w;
+            if (g[0].x - end > 0.2f * em) {
+                Glyph s;
+                s.u = ' ';
+                s.gen = true;
+                s.x = end;
+                s.w = g[0].x - end;
+                all.push_back(s);
+            }
+        }
+        all.insert(all.end(), g.begin(), g.end());
     }
-    bool ownGroup = false;
-    PieceId(base, nullptr, &ownGroup);
-    FS_MATRIX start = ObjMatrix(pieces[0]), cur = ObjMatrix(base);
-    Xform(base, 1, 0, 0, 1, start.e - cur.e, start.f - cur.f);
-    for (FPDF_PAGEOBJECT o : pieces)
-        if (o != base && FPDFPage_RemoveObject(p, o)) FPDFPageObj_Destroy(o);
-    ClearPieceMark(base);
-    if (ownGroup) ClearGroupId(d, page, base);
-    d.ContentChanged(page);
-    return base;
+    return all;
+}
+
+std::wstring EditableText(Document& d, int page, FPDF_PAGEOBJECT obj) {
+    std::vector<FPDF_PAGEOBJECT> pieces = TextPieces(d, page, obj);
+    if (pieces.empty()) return TextOf(d, page, obj);
+    std::wstring s;
+    for (const Glyph& g : PieceGlyphs(d, page, pieces)) s += FromUtf32(g.u);
+    return s;
 }
 
 bool SetObjectText(Document& d, int page, FPDF_PAGEOBJECT obj, const std::wstring& text) {
@@ -879,28 +1115,67 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
         return !ti.pieces.empty();
     };
 
+    // Text drawn in pieces by an earlier edit is read and edited as one: the
+    // first piece in the PDF's own font carries on, the others go.
+    std::vector<FPDF_PAGEOBJECT> pieces = TextPieces(d, page, obj);
+    std::vector<Glyph> O;                               // where every original character sat
+    if (!pieces.empty()) {
+        O = PieceGlyphs(d, page, pieces);
+        FPDF_PAGEOBJECT keep = pieces[0];
+        for (FPDF_PAGEOBJECT o : pieces) {
+            bool alt = true;
+            PieceId(o, &alt);
+            if (!alt) { keep = o; break; }
+        }
+        bool ownGroup = false;
+        PieceId(keep, nullptr, &ownGroup);
+        for (FPDF_PAGEOBJECT o : pieces)
+            if (o != keep && FPDFPage_RemoveObject(p, o)) FPDFPageObj_Destroy(o);
+        ClearPieceMark(keep);
+        if (ownGroup) ClearGroupId(d, page, keep);
+        d.ContentChanged(page);
+        obj = keep;
+    }
+
     // Remember the exact look before touching anything.
     TextLook lk = LookOf(obj);
     std::string base = BaseFontOf(obj);
     ti.fontName = StripSubsetPrefix(base);
     int gid = GetGroupId(obj);
     FPDF_FONT refFont = FPDFTextObj_GetFont(obj);
-    std::wstring orig = TextOf(d, page, obj);
-    PRect origBox = ObjectBounds(obj);                  // the real box, before anything changes
-    bool verifiable = !orig.empty();                    // the text layer can see this object
+    std::wstring own = TextOf(d, page, obj);            // this object's text and real box: size calibration
+    PRect origBox = ObjectBounds(obj);
+    bool verifiable = !own.empty();                     // the text layer can see this object
+    if (Upright(lk.m)) {
+        if (pieces.empty()) O = GlyphsOf(d, page, obj);
+        else if (!O.empty()) {                          // start where the whole text starts
+            Xform(obj, 1, 0, 0, 1, O[0].x - lk.m.e, 0);
+            lk.m = ObjMatrix(obj);
+        }
+    } else {
+        O.clear();
+    }
+    bool laid = false;
 
-    // 1. The object's own font has every character: done, nothing else changes.
-    if (FPDFText_SetText(obj, WS(text)) && (!verifiable || CharsRoundTrip(d, page, obj, text, &ti.missing)))
-        return done({ obj });
+    // 1. The object's own font has every character: keep the object, and its
+    //    original letter positions if re-typing lost them.
+    if (FPDFText_SetText(obj, WS(text)) && (!verifiable || CharsRoundTrip(d, page, obj, text, &ti.missing))) {
+        ti.missing.clear();
+        auto fit = FitToOriginal(d, page, obj, refFont, O, text, L"", nullptr, 1, 1, lk, gid, laid);
+        return done(laid ? fit : std::vector<FPDF_PAGEOBJECT>{ obj });
+    }
     if (ti.missing.empty())                             // couldn't tell which: treat all as missing
         for (wchar_t c : text) if (!iswspace(c) && ti.missing.find(c) == std::wstring::npos) ti.missing += c;
 
     // 2. Another copy of the same font in this PDF has them all: still the same font.
     if (FPDF_PAGEOBJECT o = TryOtherCopies(d, page, obj, refFont, base, lk, text)) {
-        if (gid) SetGroupId(d, page, o, gid);
         if (FPDFPage_RemoveObject(p, obj)) FPDFPageObj_Destroy(obj);
+        d.ContentChanged(page);
         ti.otherCopy = true;
         ti.missing.clear();
+        auto fit = FitToOriginal(d, page, o, FPDFTextObj_GetFont(o), O, text, L"", nullptr, 1, 1, lk, gid, laid);
+        if (laid) return done(fit);
+        if (gid) SetGroupId(d, page, o, gid);
         return done({ o });
     }
 
@@ -909,11 +1184,14 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
     FPDF_FONT alt = StandInFont(d, refFont, base);
     if (!alt) return false;
     float kx = 1, ky = 1;
-    CalibrateToBox(d, origBox, orig, refFont, alt, lk.tf, lk.m, kx, ky);
+    CalibrateToBox(d, origBox, own, refFont, alt, lk.tf, lk.m, kx, ky);
     ti.standIn = StripSubsetPrefix(FontNameOf(alt));
     if (usedFallback) *usedFallback = true;
-    if (Upright(lk.m))
+    if (Upright(lk.m)) {
+        auto fit = FitToOriginal(d, page, obj, refFont, O, text, ti.missing, alt, kx, ky, lk, gid, laid);
+        if (laid) return done(fit);
         return done(PlacePieces(d, page, obj, refFont, alt, kx, ky, lk, text, ti.missing, gid));
+    }
 
     // Rotated or mirrored text: the whole string in the stand-in font.
     FPDF_PAGEOBJECT repl = NewTextObj(d, alt, lk, MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, lk.m), text);
@@ -2004,7 +2282,9 @@ std::wstring ExtractText(Document& d, int page) {
     std::vector<unsigned short> buf((size_t)n + 1, 0);
     int got = FPDFText_GetText(t, 0, n, buf.data());
     if (got <= 0) return {};
-    return std::wstring(reinterpret_cast<wchar_t*>(buf.data()), (size_t)got - (buf[got - 1] == 0 ? 1 : 0));
+    std::wstring s(reinterpret_cast<wchar_t*>(buf.data()), (size_t)got - (buf[got - 1] == 0 ? 1 : 0));
+    for (auto& c : s) if (c == 0xA0) c = L' ';   // fonts often share the space / no-break space glyph
+    return s;
 }
 
 std::wstring ExtractAllText(Document& d) {
@@ -2019,11 +2299,19 @@ std::wstring ExtractAllText(Document& d) {
 std::vector<SearchHit> SearchText(Document& d, const std::wstring& needle, bool matchCase, bool whole) {
     std::vector<SearchHit> hits;
     if (needle.empty()) return hits;
+    // A space typed in the search box also finds a no-break space in the PDF.
+    std::vector<std::wstring> forms{ needle };
+    if (needle.find(L' ') != std::wstring::npos) {
+        std::wstring nb = needle;
+        for (auto& c : nb) if (c == L' ') c = (wchar_t)0xA0;
+        forms.push_back(nb);
+    }
     unsigned long flags = (matchCase ? FPDF_MATCHCASE : 0) | (whole ? FPDF_MATCHWHOLEWORD : 0);
-    for (int pg = 0; pg < d.PageCount(); ++pg) {
+    for (int pg = 0; pg < d.PageCount(); ++pg)
+    for (const std::wstring& form : forms) {
         FPDF_TEXTPAGE t = d.TextPage(pg);
         if (!t) continue;
-        FPDF_SCHHANDLE sh = FPDFText_FindStart(t, WS(needle), flags, 0);
+        FPDF_SCHHANDLE sh = FPDFText_FindStart(t, WS(form), flags, 0);
         if (!sh) continue;
         while (FPDFText_FindNext(sh)) {
             int idx = FPDFText_GetSchResultIndex(sh);

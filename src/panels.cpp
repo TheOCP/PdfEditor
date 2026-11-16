@@ -505,7 +505,9 @@ void App::DrawInlineEditor() {
         textPx = sz * zoom;
         minW = 160 * dpiScale;
     }
-    float scale = std::clamp(textPx / ImGui::GetFontSize(), 0.8f, 4.0f);
+    // Same size as the text on the page (only tiny, zoomed-out text is enlarged
+    // to stay readable) - a bigger box made editing look like a size change.
+    float scale = std::clamp(std::max(textPx, 9.0f * dpiScale) / ImGui::GetFontSize(), 0.25f, 8.0f);
     ImGui::SetNextWindowPos(ImVec2(pos.x - 3, pos.y - 3));
     ImGui::SetNextWindowBgAlpha(0.98f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(2, 2));

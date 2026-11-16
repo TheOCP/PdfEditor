@@ -381,10 +381,12 @@ static std::vector<FPDF_PAGEOBJECT> PasteTextAsObjects(App& a, int page, float x
         bool blank = std::all_of(ln.begin(), ln.end(), [](wchar_t ch) { return iswspace(ch) != 0; });
         if (!ln.empty() && !blank) {
             std::string err;
+            ops::TextEditInfo ti;
             FPDF_PAGEOBJECT o = styled && a.matchNearbyFont
-                ? ops::AddTextLike(a.doc, page, ln, style, c.fontData, c.fontBase, size, x, y, r, g, b, err)
-                : ops::AddText(a.doc, page, ln, a.CurrentFont(), size, x, y, r, g, b, err);
-            if (o) made.push_back(o);
+                ? ops::AddTextLike(a.doc, page, ln, style, c.fontData, c.fontBase, size, x, y, r, g, b, err, &ti)
+                : a.AddTextInFont(page, ln, size, x, y, r, g, b, err, &ti);
+            if (!ti.pieces.empty()) made.insert(made.end(), ti.pieces.begin(), ti.pieces.end());
+            else if (o) made.push_back(o);
         }
         y -= (float)size * 1.2f;
     }
@@ -510,14 +512,35 @@ void App::CutPieceFromImage(int page, PRect box) {
 
 void App::BeginEditText(int page, FPDF_PAGEOBJECT obj) {
     if (editing) CommitInlineEdit();
-    ops::TextProps tp = ops::ReadText(doc, page, obj);
     editing = true;
     editIsNew = false;
     editFocus = true;
     editPage = page;
     editObj = obj;
-    editBuf = W2U(tp.text);
+    editBuf = W2U(ops::EditableText(doc, page, obj));   // pieces of one text read as one
     editOriginal = editBuf;
+}
+
+// Selects everything that now shows an edited text (one object or its pieces).
+static void SelectEdited(App& a, int page, const ops::TextEditInfo& ti, FPDF_PAGEOBJECT first) {
+    if (ti.pieces.size() > 1) a.SelectObjects(page, ti.pieces, ti.groupId);
+    else if (first) a.SelectNewObject(page, first);
+}
+
+// Plain words for what happened when the PDF's font lacked a typed character.
+static std::string FontNote(const ops::TextEditInfo& ti) {
+    if (ti.standIn.empty() || ti.missing.empty()) return {};
+    std::string chars;
+    for (wchar_t c : ti.missing) {
+        if (!chars.empty()) chars += " ";
+        chars += "\"" + W2U(std::wstring(1, c)) + "\"";
+    }
+    std::string font = ti.fontName.empty() ? "The PDF's font" : ti.fontName;
+    bool one = ti.missing.size() == 1;
+    return Fmt("%s in this PDF has no %s (a PDF only stores the characters it uses), so %s drawn in %s at the "
+               "same size and spot. Everything else stays %s.",
+               font.c_str(), chars.c_str(), one ? "just that character is" : "just those characters are",
+               ti.standIn.c_str(), font.c_str());
 }
 
 void App::BeginNewText(int page, float px, float py) {
@@ -573,16 +596,20 @@ void App::CommitInlineEdit() {
         unsigned b = match ? pendingColor & 255 : (unsigned)(fillColor[2] * 255);
         std::string err;
         FPDF_PAGEOBJECT o = nullptr;
+        ops::TextEditInfo ti;
         if (match) {
             FPDF_PAGEOBJECT style = (pendingStyleGen == doc.Generation() && ops::ObjectExists(doc, editPage, pendingStyleObj))
                                         ? pendingStyleObj : nullptr;
-            o = ops::AddTextLike(doc, editPage, w, style, pendingFontData, pendingFontBase, size, editAtX, editAtY, r, g, b, err);
+            o = ops::AddTextLike(doc, editPage, w, style, pendingFontData, pendingFontBase, size, editAtX, editAtY, r, g, b,
+                                 err, &ti);
         }
-        if (!o) o = ops::AddText(doc, editPage, w, CurrentFont(), size, editAtX, editAtY, r, g, b, err);
+        if (!o) o = AddTextInFont(editPage, w, size, editAtX, editAtY, r, g, b, err, &ti);
         if (o) {
-            SelectNewObject(editPage, o);
+            SelectEdited(*this, editPage, ti, o);
             InvalidatePage(editPage);
             CommitIfDirty("Add text");
+            std::string note = FontNote(ti);
+            if (!note.empty()) Toasts(note);
         } else {
             Toasts("Could not add the text: " + err, true);
         }
@@ -590,8 +617,13 @@ void App::CommitInlineEdit() {
         FPDF_PAGEOBJECT obj = editObj;
         editObj = nullptr;
         if (editBuf == editOriginal) return;          // unchanged: leave the object exactly as it was
+        if (!ops::ObjectExists(doc, editPage, obj)) return;
         if (blank) {
-            if (ops::DeleteObjectNested(doc, editPage, obj, nullptr)) {
+            std::vector<FPDF_PAGEOBJECT> all = ops::TextPieces(doc, editPage, obj);
+            if (all.empty()) all = { obj };
+            bool any = false;
+            for (FPDF_PAGEOBJECT o : all) any |= ops::DeleteObjectNested(doc, editPage, o, nullptr);
+            if (any) {
                 ClearSelection();
                 CommitIfDirty("Delete text");
             }
@@ -599,13 +631,13 @@ void App::CommitInlineEdit() {
         }
         FPDF_PAGEOBJECT repl = nullptr;
         bool fallback = false;
-        if (ops::SetObjectTextSafe(doc, editPage, obj, w, &repl, &fallback)) {
-            SelectNewObject(editPage, repl);
+        ops::TextEditInfo ti;
+        if (ops::SetObjectTextSafe(doc, editPage, obj, w, &repl, &fallback, &ti)) {
+            SelectEdited(*this, editPage, ti, repl);
             InvalidatePage(editPage);
             CommitIfDirty("Edit text");
-            if (fallback)
-                Toasts("The PDF's font doesn't contain some of those characters, so a matching installed font "
-                       "was used (same size and position).");
+            std::string note = FontNote(ti);
+            if (!note.empty()) Toasts(note);
         } else {
             Toasts("Could not change this text", true);
         }

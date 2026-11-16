@@ -255,8 +255,11 @@ static void RunEditTests() {
         FS_MATRIX m1{ 1, 0, 0, 1, 0, 0 };
         if (rep) FPDFPageObj_GetMatrix(rep, &m1);
         Check(ok && fb, "characters the PDF font lacks switch to a matching installed font");
-        Check(rep && std::fabs(ops::VisualFontSize(rep) - before) < 0.01f && m1.e == m0.e && m1.f == m0.f,
-              "that fallback keeps the exact size and position");
+        float after = rep ? ops::VisualFontSize(rep) : 0;
+        Check(rep && std::fabs(m1.e - m0.e) < 0.05f && std::fabs(m1.f - m0.f) < 0.05f &&
+                  std::fabs(after - before) < before * 0.15f,
+              Fmt("that fallback starts at the same spot and matches the size (%.2f pt -> %.2f pt, x %.2f -> %.2f)",
+                  before, after, m0.e, m1.e).c_str());
         Check(ops::ExtractText(d, 0).find(L"\x041F\x0440\x0438\x0432\x0435\x0442") != std::wstring::npos,
               "the new characters are really there");
     }

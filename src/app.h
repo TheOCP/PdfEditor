@@ -138,6 +138,10 @@ public:
     const std::vector<FontChoice>& FontList();
     FontChoice CurrentFont();                // resolves a live handle for PDF fonts
     int docFontCount = 0;                    // how many entries at the top come from the PDF
+    // New text in the font picked in the list (a PDF font keeps its exact look,
+    // missing characters handled like an edit).
+    FPDF_PAGEOBJECT AddTextInFont(int page, const std::wstring& text, double size, float x, float y,
+                                  unsigned r, unsigned g, unsigned b, std::string& err, ops::TextEditInfo* info);
 
     // ============================== state
     HWND hwnd_ = nullptr;

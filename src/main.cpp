@@ -94,10 +94,13 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
-    if (lpCmdLine && wcsstr(lpCmdLine, L"--selftest"))
-        return RunSelfTest();
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   // WIC needs COM, self-test too
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--selftest")) {
+        int rc = RunSelfTest();
+        CoUninitialize();
+        return rc;
+    }
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     PdfInit();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance,

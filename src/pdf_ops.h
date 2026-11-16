@@ -89,9 +89,9 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
 // Text drawn in pieces by SetObjectTextSafe: all pieces of the text `obj`
 // belongs to, left to right (empty if it is a normal single object).
 std::vector<FPDF_PAGEOBJECT> TextPieces(Document& d, int page, FPDF_PAGEOBJECT obj);
-// Joins pieces back into one object (the first piece in the PDF's own font,
-// moved to where the text starts) so it can be edited as one. Returns it.
-FPDF_PAGEOBJECT JoinTextPieces(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& pieces);
+// The text as the editor shows it: all pieces joined (with their word gaps),
+// or the object's own text.
+std::wstring EditableText(Document& d, int page, FPDF_PAGEOBJECT obj);
 // Changes only the size of a text object, keeping its font, spacing, colour
 // and clip (scales it about its start point). visualSize is in page points.
 bool SetTextVisualSize(Document& d, int page, FPDF_PAGEOBJECT obj, float visualSize);

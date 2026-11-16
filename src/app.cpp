@@ -65,6 +65,24 @@ FontChoice App::CurrentFont() {
     return fc;
 }
 
+FPDF_PAGEOBJECT App::AddTextInFont(int page, const std::wstring& text, double size, float x, float y,
+                                   unsigned r, unsigned g, unsigned b, std::string& err, ops::TextEditInfo* info) {
+    FontChoice fc = CurrentFont();
+    if (fc.IsDoc() && fc.handle) {
+        FPDF_PAGEOBJECT sample = nullptr;
+        ops::FindDocFont(doc, fc.docName, page, &sample);
+        if (sample)
+            if (FPDF_PAGEOBJECT o = ops::AddTextLike(doc, page, text, sample, {}, fc.docName, size, x, y, r, g, b, err, info))
+                return o;
+    }
+    FPDF_PAGEOBJECT o = ops::AddText(doc, page, text, fc, size, x, y, r, g, b, err);
+    if (info) {
+        *info = ops::TextEditInfo{};
+        if (o) info->pieces = { o };
+    }
+    return o;
+}
+
 void App::Toasts(const std::string& msg, bool error) {
     toast.text = msg;
     toast.error = error;
