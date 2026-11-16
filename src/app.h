@@ -112,6 +112,7 @@ public:
     void GroupAllLines();
     void RefreshGroupSel();
     PRect SelectionBounds();
+    std::wstring DocName() const;               // file name shown; a new document's name in the UI language
     void MoveSelection(float dxPage, float dyPage);
     void ResizeSelectionTo(PRect target);
     // Alignment while moving text: guides to other text on the page, snapping.
@@ -228,6 +229,15 @@ public:
     float alignOx = 0, alignOy = 0;         // where that baseline started
     std::vector<ops::AlignRef> alignCands;  // other text on the page
     std::vector<float> guideX, guideY;      // guide lines on screen now (page points)
+
+    // "Always show guide lines": lines through the selected text across the
+    // page; the other objects' edges are cached per selection.
+    void DrawSelectionGuides(ImDrawList* dl);
+    std::vector<ops::AlignRef> guideRefs;
+    int guideRefsPage = -1;
+    uint32_t guideRefsGen = 0, guideRefsDoc = 0;
+    FPDF_PAGEOBJECT guideRefsObj = nullptr;
+    size_t guideRefsCount = 0;
 
     // multi-selection / grouping
     std::vector<FPDF_PAGEOBJECT> groupSel;

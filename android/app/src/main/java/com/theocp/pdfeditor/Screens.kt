@@ -45,6 +45,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
@@ -376,6 +377,10 @@ private fun SelectionBar(ed: Editor, modifier: Modifier) {
         @Composable fun act(icon: ImageVector, label: String, onClick: () -> Unit) =
             IconButton(onClick = onClick) { Icon(icon, label, tint = C.Text) }
         if (s.canEditText) act(Icons.Outlined.Edit, tr("Edit text")) { ed.beginEditText() }
+        if (!s.annot && (s.isText || s.texts > 0))
+            IconButton(onClick = { ed.guidesAlways = !ed.guidesAlways; ed.prefs.guidesAlways = ed.guidesAlways }) {
+                Icon(Icons.Outlined.GridOn, tr("Always show guide lines"), tint = if (ed.guidesAlways) C.Accent else C.Text)
+            }
         act(Icons.Outlined.ContentCopy, tr("Copy")) { ed.copy() }
         act(Icons.Outlined.ContentCut, tr("Cut")) { ed.cut() }
         act(Icons.Outlined.Delete, tr("Delete")) { ed.delete() }

@@ -88,6 +88,9 @@ class Prefs(ctx: Context) {
     var alignSnap: Boolean
         get() = sp.getBoolean("alignsnap", true)
         set(v) = sp.edit().putBoolean("alignsnap", v).apply()
+    var guidesAlways: Boolean
+        get() = sp.getBoolean("guidesalways", false)
+        set(v) = sp.edit().putBoolean("guidesalways", v).apply()
     var recent: List<String>
         get() = (sp.getString("recent", "") ?: "").split('\n').filter { it.isNotBlank() }
         set(v) = sp.edit().putString("recent", v.take(8).joinToString("\n")).apply()

@@ -212,7 +212,7 @@ void SetLineColor(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsign
 bool TextOrigin(FPDF_PAGEOBJECT obj, const FS_MATRIX& accum, float& x, float& y);
 
 // ---- alignment: moving text into line with other text ----
-struct AlignRef { float ox = 0, oy = 0; bool origin = false; PRect box; };
+struct AlignRef { float ox = 0, oy = 0; bool origin = false; bool line = false; PRect box; };
 // Every text on `page` except `exclude`, as things to line up with.
 std::vector<AlignRef> AlignRefs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& exclude);
 struct AlignHit { float dx = 0, dy = 0; bool x = false, y = false; float gx = 0, gy = 0; };
@@ -222,6 +222,21 @@ struct AlignHit { float dx = 0, dy = 0; bool x = false, y = false; float gx = 0,
 // corrections to add and where the guide lines are.
 AlignHit AlignSnap(const std::vector<AlignRef>& refs, PRect start, bool hasOrigin, float ox, float oy,
                    float dx, float dy, float thr);
+
+// ---- guide lines through a selection (shown the whole time it is selected) ----
+// x[0] = left (where the text starts on its baseline, else the left edge),
+// x[1] = right edge, y[0] = baseline (bottom edge when there is no single
+// baseline), y[1] = top edge. Page points.
+struct GuideEdges { float x[2] = { 0, 0 }, y[2] = { 0, 0 }; bool baseline = false; };
+// objs = the selection (objs[0] mapped by firstAccum when it is the only one),
+// box = its page bounds.
+GuideEdges SelectionEdges(const std::vector<FPDF_PAGEOBJECT>& objs, const FS_MATRIX& firstAccum, PRect box);
+// Every other object on the page - text, lines, pictures, shapes.
+std::vector<AlignRef> GuideRefs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& exclude);
+// Which guide lines meet another object's edge exactly (within tol points),
+// and the boxes of the objects they meet.
+struct GuideMatch { bool x[2] = { false, false }, y[2] = { false, false }; std::vector<PRect> boxes; };
+GuideMatch MatchGuides(const std::vector<AlignRef>& refs, const GuideEdges& e, float tol);
 
 // Resizes several top-level objects (e.g. a table) from `cur` to `target`.
 // Lines keep their thickness and text keeps its size (it moves with its cell).

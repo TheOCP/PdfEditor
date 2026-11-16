@@ -2595,6 +2595,67 @@ AlignHit AlignSnap(const std::vector<AlignRef>& refs, PRect start, bool hasOrigi
     return h;
 }
 
+GuideEdges SelectionEdges(const std::vector<FPDF_PAGEOBJECT>& objs, const FS_MATRIX& firstAccum, PRect box) {
+    GuideEdges e;
+    e.x[0] = box.l; e.x[1] = box.r;
+    e.y[0] = box.b; e.y[1] = box.t;
+    if (objs.empty()) return e;
+    FS_MATRIX id{ 1, 0, 0, 1, 0, 0 };
+    // Left: where the text starts, when the leftmost object is text.
+    // Baseline: when every object is text sitting on the same baseline.
+    bool allText = true, sameBase = true, haveBase = false;
+    float base = 0, leftMost = 1e30f, leftX = 0;
+    bool leftIsText = false;
+    for (size_t i = 0; i < objs.size(); ++i) {
+        const FS_MATRIX& acc = objs.size() == 1 ? firstAccum : id;
+        PRect b = ObjectPageBounds(objs[i], acc);
+        float ox = 0, oy = 0;
+        bool o = TextOrigin(objs[i], acc, ox, oy);
+        if (!o) allText = false;
+        else if (!haveBase) { base = oy; haveBase = true; }
+        else if (std::fabs(oy - base) > 0.5f) sameBase = false;
+        if (b.l < leftMost) { leftMost = b.l; leftIsText = o; leftX = ox; }
+    }
+    if (leftIsText) e.x[0] = leftX;
+    if (allText && sameBase && haveBase) { e.y[0] = base; e.baseline = true; }
+    return e;
+}
+
+std::vector<AlignRef> GuideRefs(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& exclude) {
+    std::vector<AlignRef> out;
+    auto excluded = [&](FPDF_PAGEOBJECT o) { return o && std::find(exclude.begin(), exclude.end(), o) != exclude.end(); };
+    for (const auto& oi : ListObjects(d, page)) {
+        if (oi.type == FPDF_PAGEOBJ_FORM) continue;
+        if (excluded(oi.obj) || excluded(oi.parent)) continue;
+        if (oi.bounds.W() <= 0.05f && oi.bounds.H() <= 0.05f) continue;
+        AlignRef r;
+        r.box = oi.bounds;
+        if (oi.type == FPDF_PAGEOBJ_TEXT) r.origin = TextOrigin(oi.obj, oi.accum, r.ox, r.oy);
+        else r.line = IsLine(oi.obj);
+        out.push_back(r);
+    }
+    return out;
+}
+
+GuideMatch MatchGuides(const std::vector<AlignRef>& refs, const GuideEdges& e, float tol) {
+    GuideMatch m;
+    for (const AlignRef& r : refs) {
+        // the other object's edges: start / right / centre of a line, and
+        // baseline (or bottom) / top / centre of a line
+        float xs[3] = { r.origin ? r.ox : r.box.l, r.box.r, (r.box.l + r.box.r) * 0.5f };
+        float ys[3] = { r.origin ? r.oy : r.box.b, r.box.t, (r.box.b + r.box.t) * 0.5f };
+        int n = r.line ? 3 : 2;
+        bool hit = false;
+        for (int k = 0; k < 2; ++k)
+            for (int j = 0; j < n; ++j) {
+                if (std::fabs(e.x[k] - xs[j]) <= tol) { m.x[k] = true; hit = true; }
+                if (std::fabs(e.y[k] - ys[j]) <= tol) { m.y[k] = true; hit = true; }
+            }
+        if (hit && m.boxes.size() < 64) m.boxes.push_back(r.box);
+    }
+    return m;
+}
+
 // ---- resizing several objects (a table) --------------------------------------
 
 PRect ResizeGroup(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& objs, PRect cur, PRect target,

@@ -256,6 +256,8 @@ fun PropertiesPanel(ed: Editor, modifier: Modifier = Modifier) {
             // Moving text: guide lines and snapping to other text.
             if (s.canEditText || s.texts > 0) {
                 HorizontalDivider(color = C.Line, modifier = Modifier.padding(vertical = 10.dp))
+                CheckRow(tr("Always show guide lines"), ed.guidesAlways) { ed.guidesAlways = it; ed.prefs.guidesAlways = it }
+                if (ed.guidesAlways) Dim(tr("Pink = lines up exactly with something"))
                 CheckRow(tr("Show alignment lines when moving"), ed.alignGuides) { ed.alignGuides = it; ed.prefs.alignGuides = it }
                 CheckRow(tr("Snap into line with other text"), ed.alignSnap) { ed.alignSnap = it; ed.prefs.alignSnap = it }
             }

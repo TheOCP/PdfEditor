@@ -63,7 +63,7 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "Properties / metadata", "Eigenschaften / Metadaten" },
     { "View", "Ansicht" },
     { "Page thumbnails", "Seitenminiaturen" },
-    { "Properties panel", "Eigenschaften-Leiste" },
+    { "Properties panel", "Eigenschaftenleiste" },
     { "Zoom in", "Vergrößern" },
     { "Zoom out", "Verkleinern" },
     { "Fit width", "An Breite anpassen" },
@@ -76,7 +76,7 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "About", "Über" },
     { "  (unsaved)", "  (nicht gespeichert)" },
     { "by TheOCProductions & ShortGG", "von TheOCProductions & ShortGG" },
-    { "PDF Editor", "PDF-Editor" },
+    { "PDF Editor", "PDF Editor" },
 
     // ---- toolbar / search
     { "Select", "Auswählen" },
@@ -220,7 +220,7 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "Author:", "Autor:" },
     { "Subject:", "Thema:" },
     { "Keywords:", "Stichwörter:" },
-    { "Creator:", "Anwendung:" },
+    { "Creator:", "Erstellt mit:" },
     { "Producer:", "PDF-Erzeuger:" },
     { "(unsaved)", "(nicht gespeichert)" },
     { "Digital signatures: %d (editing will invalidate them)",
@@ -249,7 +249,6 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "Header row", "Kopfzeile" },
     { "Header height", "Höhe der Kopfzeile" },
     { "Margin", "Rand" },
-    { "Preset: 4 columns + header (like the screenshot)", "Vorlage: 4 Spalten + Kopfzeile (wie im Screenshot)" },
     { "Create", "Erstellen" },
     { "Table added (%d editable lines)", "Tabelle eingefügt (%d bearbeitbare Linien)" },
     { "Could not build the table (check the margin vs page size)",
@@ -437,6 +436,8 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "Thinner", "Dünner" },
     { "Thicker", "Dicker" },
     { "Show alignment lines when moving", "Ausrichtungslinien beim Verschieben zeigen" },
+    { "Always show guide lines", "Hilfslinien immer anzeigen" },
+    { "Pink = lines up exactly with something", "Pink = genau bündig mit etwas" },
     { "Print...", "Drucken..." },
     { "Print", "Drucken" },
     { "Sent %d page(s) to the printer", "%d Seite(n) an den Drucker gesendet" },
@@ -454,7 +455,7 @@ const std::pair<const char*, const char*> kGerman[] = {
     { "could not write the registration", "die Registrierung konnte nicht gespeichert werden" },
     { "Snap into line with other text", "An anderem Text ausrichten (einrasten)" },
     { "Hold Alt while dragging to place freely", "Beim Ziehen Alt halten, um frei zu platzieren" },
-    { "Keep line spacing when resizing", "Linienabstände beim Größe ändern beibehalten" },
+    { "Keep line spacing when resizing", "Linienabstände beim Ändern der Größe beibehalten" },
     { "Only the outer row / column changes size", "Nur die äußere Zeile / Spalte ändert ihre Größe" },
 
     // ---- error messages from the editing layer
@@ -603,6 +604,8 @@ void SetSettingFlag(const char* key, bool on) {
     Flags()[key] = on;
     SaveSettings();
 }
+
+void SetSettingFlagNoSave(const char* key, bool on) { Flags()[key] = on; }
 
 void LoadSettings() {
     bool found = false;

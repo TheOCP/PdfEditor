@@ -152,8 +152,9 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
     const Cfg cfgs[] = { { 1280, 720, 1.0f }, { 1280, 720, 1.5f }, { 1920, 1080, 1.0f }, { 1920, 1080, 1.5f },
                          { 2560, 1440, 1.0f }, { 3840, 2160, 2.0f }, { 1024, 700, 1.0f } };
     const char* states[] = { "welcome", "main", "text", "group", "toast", "help", "settings", "table", "meta",
-                             "about", "import", "edit", "password", "line", "lines", "align" };
+                             "about", "import", "edit", "password", "line", "lines", "align", "guides" };
     SetUiScaleSetting(1.0f);
+    const bool guidesSetting = SettingFlag("guidesalways", false);
     for (int li = 0; li < 2; ++li) {
         g_app.ChangeLanguage(li ? Lang::German : Lang::English, false);   // never saved
         for (const Cfg& c : cfgs) {
@@ -170,6 +171,7 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
                 g_app.CancelInlineEdit();
                 g_app.toast.text.clear();
                 g_app.uiShotOpenAll = false;
+                SetSettingFlagNoSave("guidesalways", name == "guides" ? true : guidesSetting);
                 if (name == "welcome") {
                     g_app.doc.Close();
                     g_app.cache.clear();
@@ -234,6 +236,27 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
                     g_app.toast.text.clear();
                     g_app.fitPending = true;
                 }
+                else if (name == "guides") {
+                    // Selected text with "Always show guide lines": the start and the
+                    // baseline line up with other text (pink), right edge / top don't.
+                    g_app.doc.CreateBlank(595, 842);
+                    g_app.cache.clear();
+                    g_app.thumbs.clear();
+                    FontChoice fc; fc.stdName = "Helvetica";
+                    std::string e;
+                    ops::AddText(g_app.doc, 0, L"Invoice date", fc, 12, 72, 760, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"Amount", fc, 12, 330, 760, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"Description", fc, 12, 72, 730, 0, 0, 0, e);
+                    ops::AddText(g_app.doc, 0, L"12.50", fc, 10, 330, 700, 0, 0, 0, e);
+                    ops::AddLine(g_app.doc, 0, 60, 690, 420, 690, 0, 0, 0, 0.5f);
+                    ops::AddLine(g_app.doc, 0, 310, 680, 310, 780, 0, 0, 0, 0.5f);
+                    FPDF_PAGEOBJECT mv = ops::AddText(g_app.doc, 0, L"Total", fc, 12, 72, 700, 0, 0, 0, e);
+                    g_app.doc.Commit("guides");
+                    for (auto& o : ops::ListObjects(g_app.doc, 0))
+                        if (o.obj == mv) { g_app.sel.Set(g_app.doc, 0, o); g_app.groupSel = { mv }; break; }
+                    g_app.toast.text.clear();
+                    g_app.fitPending = true;
+                }
                 else if (name == "password") {
                     g_app.pwFile = L"x.pdf";
                     g_app.pwError = "Wrong password, try again.";
@@ -279,6 +302,7 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
             }
         }
     }
+    SetSettingFlagNoSave("guidesalways", guidesSetting);
     if (report) fclose(report);
     return 0;
 }

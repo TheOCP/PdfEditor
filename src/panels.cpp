@@ -190,7 +190,7 @@ void App::DrawMenuBar() {
     }
     if (has) {
         // The file name on the right, only when there is room next to the menus.
-        std::string title = W2U(doc.displayName) + (doc.modified ? T("  (unsaved)") : "");
+        std::string title = W2U(DocName()) + (doc.modified ? T("  (unsaved)") : "");
         float w = ImGui::CalcTextSize(title.c_str()).x;
         float x = ImGui::GetWindowWidth() - w - 20 * dpiScale;
         if (x > ImGui::GetCursorPosX() + 24 * dpiScale) {
@@ -483,6 +483,9 @@ static void DrawLineThickness(App& a) {
 
 // Alignment while moving text (remembered).
 static void DrawAlignOptions() {
+    bool al = SettingFlag("guidesalways", false);
+    if (CheckboxWrap(T("Always show guide lines"), &al)) SetSettingFlag("guidesalways", al);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Pink = lines up exactly with something"));
     bool g = SettingFlag("alignguides", true), s = SettingFlag("alignsnap", true);
     if (CheckboxWrap(T("Show alignment lines when moving"), &g)) SetSettingFlag("alignguides", g);
     if (CheckboxWrap(T("Snap into line with other text"), &s)) SetSettingFlag("alignsnap", s);

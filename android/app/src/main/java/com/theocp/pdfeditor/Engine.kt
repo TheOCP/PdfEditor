@@ -51,6 +51,8 @@ object Engine {
     // alignment while text is dragged
     external fun nAlignBegin(): Boolean
     external fun nAlignSnap(dx: Float, dy: Float, thr: Float, snap: Boolean): FloatArray   // [dx, dy, guideX, guideY]
+    // guide lines through selected text: [left, right, baseline, top, hits, boxes (l,b,r,t)...], empty = none
+    external fun nGuides(): FloatArray
     external fun nCommit(label: String)
     external fun nDelete()
     external fun nGroup(): Int

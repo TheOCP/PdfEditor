@@ -205,6 +205,59 @@ void App::SnapMove(float& dx, float& dy, bool freePlacement) {
     if (h.y) { if (snap) dy += h.dy; if (show) guideY.push_back(h.gy); }
 }
 
+// Axis lines on screen, cut to the visible canvas (pages can be far taller
+// than the window when zoomed in).
+static void GuideLine(App& a, ImDrawList* dl, ImVec2 p, ImVec2 q, ImU32 col, float w, bool dashed) {
+    ImVec2 lo = a.canvasOrigin, hi(a.canvasOrigin.x + a.canvasSize.x, a.canvasOrigin.y + a.canvasSize.y);
+    auto clampV = [&](ImVec2 v) { return ImVec2(std::clamp(v.x, lo.x, hi.x), std::clamp(v.y, lo.y, hi.y)); };
+    if ((p.x < lo.x && q.x < lo.x) || (p.x > hi.x && q.x > hi.x) || (p.y < lo.y && q.y < lo.y) || (p.y > hi.y && q.y > hi.y)) return;
+    p = clampV(p); q = clampV(q);
+    float len = Dist(p, q);
+    if (len < 1) return;
+    if (!dashed) { dl->AddLine(p, q, col, w); return; }
+    float dash = 6.0f * a.dpiScale, gap = 4.0f * a.dpiScale;
+    ImVec2 d((q.x - p.x) / len, (q.y - p.y) / len);
+    for (float t = 0; t < len; t += dash + gap) {
+        float e = std::min(len, t + dash);
+        dl->AddLine(ImVec2(p.x + d.x * t, p.y + d.y * t), ImVec2(p.x + d.x * e, p.y + d.y * e), col, w);
+    }
+}
+
+// Lines through the selected text's start, right edge, baseline and top,
+// across the whole page - pink where they meet another object exactly.
+void App::DrawSelectionGuides(ImDrawList* dl) {
+    if (!SettingFlag("guidesalways", false) || AnnotSelected() || !sel.Valid(doc)) return;
+    if (sel.page < 0 || sel.page >= (int)cache.size() || !cache[sel.page].laid) return;
+    std::vector<FPDF_PAGEOBJECT> mine = groupSel.size() > 1 ? groupSel : std::vector<FPDF_PAGEOBJECT>{ sel.obj };
+    bool text = false;
+    for (auto o : mine) text |= ops::ObjectType(o) == FPDF_PAGEOBJ_TEXT;
+    if (!text) return;
+
+    if (guideRefsPage != sel.page || guideRefsGen != doc.Generation() || guideRefsDoc != doc.DocId() ||
+        guideRefsObj != sel.obj || guideRefsCount != mine.size()) {
+        guideRefs = ops::GuideRefs(doc, sel.page, mine);
+        guideRefsPage = sel.page; guideRefsGen = doc.Generation(); guideRefsDoc = doc.DocId();
+        guideRefsObj = sel.obj; guideRefsCount = mine.size();
+    }
+    ops::GuideEdges e = ops::SelectionEdges(mine, sel.accum, SelectionBounds());
+    ops::GuideMatch m = ops::MatchGuides(guideRefs, e, 0.25f);
+
+    PRect pb = doc.PageBox(sel.page);
+    ImU32 cGuide = IM_COL32(40, 160, 255, 210), cHit = IM_COL32(255, 64, 170, 240);
+    float w = std::max(1.0f, 1.0f * dpiScale), wHit = std::max(1.0f, 1.5f * dpiScale);
+    for (const PRect& r : m.boxes) {
+        ImVec2 p0, p1;
+        ScreenBox(*this, sel.page, r, p0, p1);
+        dl->AddRect(ImVec2(p0.x - 1, p0.y - 1), ImVec2(p1.x + 1, p1.y + 1), IM_COL32(255, 64, 170, 150), 0, 0, w);
+    }
+    for (int k = 0; k < 2; ++k) {
+        GuideLine(*this, dl, PageToScreenPt(sel.page, e.x[k], pb.b), PageToScreenPt(sel.page, e.x[k], pb.t),
+                  m.x[k] ? cHit : cGuide, m.x[k] ? wHit : w, !m.x[k]);
+        GuideLine(*this, dl, PageToScreenPt(sel.page, pb.l, e.y[k]), PageToScreenPt(sel.page, pb.r, e.y[k]),
+                  m.y[k] ? cHit : cGuide, m.y[k] ? wHit : w, !m.y[k]);
+    }
+}
+
 void App::DeleteSelection() {
     if (AnnotSelected()) {
         int pg = annSelPage;
@@ -1003,6 +1056,8 @@ void App::DrawCanvas() {
             }
         }
     }
+    // --- guide lines through selected text (when switched on) ---
+    DrawSelectionGuides(dl);
     // --- alignment guides while moving text ---
     if (dragging && dragMode == 1 && dragArmed && sel.Valid(doc) && sel.page < n && cache[sel.page].laid &&
         (!guideX.empty() || !guideY.empty())) {

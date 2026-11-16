@@ -130,11 +130,18 @@ void App::CommitIfDirty(const std::string& label) {
 
 // --------------------------------------------------------------- file commands
 
+// The document's name as shown: a new document is "Untitled.pdf" in the
+// engine and gets the name in the UI language here.
+std::wstring App::DocName() const {
+    if (doc.displayName.empty() || doc.displayName == L"Untitled.pdf") return TW("Untitled.pdf");
+    return doc.displayName;
+}
+
 bool App::ConfirmDiscard() {
     if (editing) CommitInlineEdit();
     EndFormFocus();
     if (!doc.Raw() || !doc.modified) return true;
-    std::string name = doc.displayName.empty() ? std::string(T("Untitled.pdf")) : W2U(doc.displayName);
+    std::string name = W2U(DocName());
     std::wstring msg = U2W(Fmt(T("Save changes to \"%s\" first?"), name.c_str()));
     int r = MessageBoxW(hwnd_, msg.c_str(), TW("PDF Editor").c_str(), MB_YESNOCANCEL | MB_ICONWARNING);
     if (r == IDCANCEL) return false;
@@ -217,7 +224,7 @@ bool App::Save() {
 bool App::SaveAs() {
     if (!doc.Raw()) return false;
     if (editing) CommitInlineEdit();
-    std::wstring name = doc.displayName.empty() ? TW("document.pdf") : doc.displayName;
+    std::wstring name = DocName();
     std::wstring out;
     if (!SaveFileDialog(hwnd_, PdfFilter(), name.c_str(), L"pdf", out)) return false;
     std::string err;
@@ -307,7 +314,7 @@ void App::UpdateTitle() {
     std::wstring app = TW("PDF Editor");
     std::wstring t = app;
     if (doc.Raw())
-        t = (doc.displayName.empty() ? TW("Untitled.pdf") : doc.displayName) + (doc.modified ? L" *" : L"") + L" - " + app;
+        t = DocName() + (doc.modified ? L" *" : L"") + L" - " + app;
     if (t != lastTitle) {
         SetWindowTextW(hwnd_, t.c_str());
         lastTitle = t;

@@ -104,6 +104,7 @@ class Editor(private val ctx: Context, val prefs: Prefs) {
     var keepSpacing by mutableStateOf(prefs.keepSpacing)     // table resize: only the outer row / column changes
     var alignGuides by mutableStateOf(prefs.alignGuides)     // guide lines when text lines up with other text
     var alignSnap by mutableStateOf(prefs.alignSnap)         // ...and snap it into line
+    var guidesAlways by mutableStateOf(prefs.guidesAlways)   // lines through selected text, the whole time
 
     fun toast(text: String, error: Boolean = false) { message = text to error }
 

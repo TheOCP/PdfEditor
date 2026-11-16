@@ -717,6 +717,29 @@ int RunSelfTest() {
         float ox = 0, oy = 0;
         Check(t1 && ops::TextOrigin(t1, FS_MATRIX{ 1, 0, 0, 1, 0, 0 }, ox, oy) && std::fabs(ox - 72) < 0.5f,
               "text origin = where its baseline starts");
+
+        // "Always show guide lines": which guides meet something exactly
+        FS_MATRIX idm{ 1, 0, 0, 1, 0, 0 };
+        ops::AddText(a, 0, L"Below", fc, 12, 72, 650, 0, 0, 0, aerr);        // same start, other row
+        ops::AddText(a, 0, L"Same row", fc, 12, 300, 700, 0, 0, 0, aerr);    // same baseline
+        ops::AddLine(a, 0, 400, 600, 400, 760, 0, 0, 0, 1.0f);              // vertical line
+        std::vector<FPDF_PAGEOBJECT> mine{ t1 };
+        auto refs = ops::GuideRefs(a, 0, mine);
+        Check(refs.size() == 3, "guide lines look at every other object (text and lines)");
+        ops::GuideEdges ge = ops::SelectionEdges(mine, idm, ops::ObjectBounds(t1));
+        Check(ge.baseline && std::fabs(ge.x[0] - 72) < 0.01f && std::fabs(ge.y[0] - 700) < 0.01f,
+              "guides go through the text's start and baseline");
+        ops::GuideMatch gm = ops::MatchGuides(refs, ge, 0.25f);
+        Check(gm.x[0] && gm.y[0] && gm.boxes.size() == 2, "guides show the text below and the text in the same row");
+        ops::TranslateObjectPage(a, 0, t1, idm, 3, 0);
+        ge = ops::SelectionEdges(mine, idm, ops::ObjectBounds(t1));
+        gm = ops::MatchGuides(refs, ge, 0.25f);
+        Check(!gm.x[0] && gm.y[0], "3 pt to the right: start no longer lines up, row still does");
+        PRect tb = ops::ObjectBounds(t1);
+        ops::TranslateObjectPage(a, 0, t1, idm, 400 - tb.r, 0);
+        ge = ops::SelectionEdges(mine, idm, ops::ObjectBounds(t1));
+        gm = ops::MatchGuides(refs, ge, 0.25f);
+        Check(gm.x[1], "right edge meets the vertical line");
     }
 
     // ---- split one multi-line path into movable lines ----

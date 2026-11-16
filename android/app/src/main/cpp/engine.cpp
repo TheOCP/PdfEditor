@@ -47,6 +47,12 @@ struct Engine {
     PRect alignStart;
     bool alignHasOrigin = false;
     float alignOx = 0, alignOy = 0;
+    // "always show guide lines": the other objects' edges, per selection
+    std::vector<ops::AlignRef> guideRefs;
+    int guidePage = -1;
+    uint32_t guideGen = 0, guideDoc = 0;
+    FPDF_PAGEOBJECT guideObj = nullptr;
+    size_t guideCount = 0;
 };
 
 Engine& E() {
@@ -567,6 +573,38 @@ JFN(jfloatArray, nSelBounds)(JNIEnv* env, jobject) {
     float v[4] = { r.l, r.b, r.r, r.t };
     jfloatArray a = env->NewFloatArray(4);
     env->SetFloatArrayRegion(a, 0, 4, v);
+    return a;
+}
+
+// Guide lines through the selected text (page points):
+// [left, right, baseline, top, hits, l,b,r,t of each object they meet...]
+// hits: 1 left, 2 right, 4 baseline, 8 top line up exactly with something.
+// Empty when nothing with text is selected.
+JFN(jfloatArray, nGuides)(JNIEnv* env, jobject) {
+    LOCK;
+    Engine& e = E();
+    Sel& s = e.sel;
+    std::vector<float> v;
+    if (SelValid() && !AnnotSel()) {
+        std::vector<FPDF_PAGEOBJECT> mine = Members();
+        bool text = false;
+        for (auto o : mine) text |= ops::ObjectType(o) == FPDF_PAGEOBJ_TEXT;
+        if (text) {
+            if (e.guidePage != s.page || e.guideGen != e.doc.Generation() || e.guideDoc != e.doc.DocId() ||
+                e.guideObj != s.obj || e.guideCount != mine.size()) {
+                e.guideRefs = ops::GuideRefs(e.doc, s.page, mine);
+                e.guidePage = s.page; e.guideGen = e.doc.Generation(); e.guideDoc = e.doc.DocId();
+                e.guideObj = s.obj; e.guideCount = mine.size();
+            }
+            ops::GuideEdges g = ops::SelectionEdges(mine, s.accum, SelBounds());
+            ops::GuideMatch m = ops::MatchGuides(e.guideRefs, g, 0.25f);
+            int hits = (m.x[0] ? 1 : 0) | (m.x[1] ? 2 : 0) | (m.y[0] ? 4 : 0) | (m.y[1] ? 8 : 0);
+            v = { g.x[0], g.x[1], g.y[0], g.y[1], (float)hits };
+            for (const PRect& r : m.boxes) { v.push_back(r.l); v.push_back(r.b); v.push_back(r.r); v.push_back(r.t); }
+        }
+    }
+    jfloatArray a = env->NewFloatArray((jsize)v.size());
+    if (!v.empty()) env->SetFloatArrayRegion(a, 0, (jsize)v.size(), v.data());
     return a;
 }
 

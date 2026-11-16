@@ -27,6 +27,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
@@ -223,6 +224,22 @@ fun PageView(ed: Editor, vs: ViewState, modifier: Modifier = Modifier) {
         val ox = vs.lefts[page] - vs.scrollX
         val oy = vs.tops[page] - vs.scrollY
         return Rect(min(a[0], b[0]) + ox, min(a[1], b[1]) + oy, max(a[0], b[0]) + ox, max(a[1], b[1]) + oy)
+    }
+    // "Always show guide lines": lines through the selected text, recomputed when it changes
+    val guides = remember(ed.sel, ed.guidesAlways, ed.tick) {
+        val s = ed.sel
+        if (ed.guidesAlways && s.has && !s.annot && (s.isText || s.texts > 0)) Engine.nGuides() else null
+    }
+    // A page-space line x = v (isX) or y = v, as a screen line across the whole page.
+    fun guideAcross(pg: Int, v: Float, isX: Boolean): Pair<Offset, Offset> {
+        val a = if (isX) Engine.nPageToDev(pg, vs.scale, v, 0f) else Engine.nPageToDev(pg, vs.scale, 0f, v)
+        val b = if (isX) Engine.nPageToDev(pg, vs.scale, v, 100f) else Engine.nPageToDev(pg, vs.scale, 100f, v)
+        val top = vs.tops[pg] - vs.scrollY
+        val left = vs.lefts[pg] - vs.scrollX
+        return if (abs(a[0] - b[0]) < abs(a[1] - b[1]))        // vertical on screen
+            Offset(a[0] + left, top) to Offset(a[0] + left, top + vs.heights[pg])
+        else
+            Offset(left, a[1] + top) to Offset(left + vs.widths[pg], a[1] + top)
     }
     fun handles(r: Rect): List<Offset> = listOf(
         Offset(r.left, r.top), Offset(r.center.x, r.top), Offset(r.right, r.top),
@@ -513,6 +530,27 @@ fun PageView(ed: Editor, vs: ViewState, modifier: Modifier = Modifier) {
                         drawCircle(Color.White, 6f * dp, p)
                         drawCircle(C.Accent, 6f * dp, p, style = Stroke(width = 2f * dp))
                     }
+                }
+            }
+            // guide lines through the selected text: pink where they meet something exactly
+            if (guides != null && guides.size >= 5 && sel.has && sel.page in sizes.indices && sel.page < vs.tops.size) {
+                val pg = sel.page
+                val hits = guides[4].toInt()
+                val blue = Color(0xD228A0FF)
+                val pink = Color(0xF0FF40AA)
+                val dash = PathEffect.dashPathEffect(floatArrayOf(6f * dp, 4f * dp))
+                var k = 5
+                while (k + 3 < guides.size) {
+                    val r = pageRectOnScreen(pg, PRect(guides[k], guides[k + 1], guides[k + 2], guides[k + 3]))
+                    drawRect(Color(0x96FF40AA), Offset(r.left - dp, r.top - dp), Size(r.width + 2 * dp, r.height + 2 * dp),
+                        style = Stroke(width = 1f * dp))
+                    k += 4
+                }
+                for (i in 0..3) {
+                    val hit = hits and (1 shl i) != 0
+                    val (p, q) = guideAcross(pg, guides[i], i < 2)
+                    drawLine(if (hit) pink else blue, p, q, strokeWidth = (if (hit) 1.5f else 1f) * dp,
+                        pathEffect = if (hit) null else dash)
                 }
             }
             // alignment guides while text is dragged
