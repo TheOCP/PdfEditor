@@ -1,83 +1,88 @@
 # PDF Editor
 
-A desktop PDF editor for Windows, built in C++ on **PDFium** (Chromium's PDF
-engine) with a **Dear ImGui + Direct3D 11** interface. Same toolchain and project
-style as the other tools in this repo set (Visual Studio 2026, CMake, static CRT,
-ImGui pulled via FetchContent).
+by TheOCProductions & ShortGG
 
-It opens real PDFs and edits their actual content — text, images, vector shapes,
-pages, form fields and metadata — then writes a valid PDF back out.
+A PDF editor for **Windows** and **Android** that edits the real content of a
+PDF - text, lines, pictures, pages and form fields - and writes a valid PDF
+back out. Both versions share one editing engine (C++ on
+[PDFium](https://pdfium.googlesource.com/pdfium/)); the interface is English or
+German.
+
+Downloads: see **Releases** (`PdfEditor-Windows.zip`, `PdfEditor-Android.apk`).
 
 ## Features
 
-**Content editing**
-- Select, move, resize and delete any page object (text, image, path/shape).
-- Edit existing text in place (double-click) — keeps the object's font, size and colour.
-- Add new text with any of the 14 standard PDF fonts or any installed TrueType font
-  (the font is embedded on save). Pick colour and size.
-- Insert images (PNG, JPEG, BMP, GIF, TIFF, and more via Windows codecs); move/scale them.
-- Draw filled / outlined rectangles.
-- Change the fill/text colour of a selected object.
+**Text**
+- Edit existing text in place; the font, size and letter positions stay exactly
+  as they were (also with subset and custom fonts).
+- Add new text in the PDF's own font, a standard PDF font or an installed font.
+- Change colour, size or font of any text.
+
+**Lines and shapes**
+- Select, move, resize, copy and delete anything on a page.
+- Line thickness for one line, several lines or a whole table at once (slider
+  plus exact value) - works for lines however the PDF draws them (strokes,
+  thin filled rectangles, a grid drawn as one shape, thin pictures).
+- Table / form generator; every line stays a separate, editable line.
+- Resizing a table keeps the line thickness; optionally the spacing between
+  lines stays the same and only the outer row / column changes.
+- Split a shape into separate lines, group and ungroup.
+- Alignment guides: moving text shows when it lines up with other text and
+  can snap it into line (both switchable).
+
+**Pictures**
+- Insert pictures, move and scale them, cut a piece out of a picture.
 
 **Redaction**
-- Drag a box to *permanently remove* every object under it and paint it solid —
-  the content is deleted from the file, not just covered.
+- Removes everything under a box from the file - not just covered.
 
 **Pages**
-- Insert blank, duplicate, delete, rotate (90° CW/CCW), and reorder pages
-  (right-click a thumbnail, or the Page menu).
-- Import pages from another PDF (with an optional page range and password).
-- Export pages as PNG images at a chosen DPI.
+- Insert, duplicate, delete, rotate and reorder pages; import pages from
+  another PDF; export pages as PNG.
 
-**Forms**
-- Fill interactive AcroForm fields (click a field and type).
-- List all form fields; flatten forms and annotations into page content.
-
-**Navigate & inspect**
-- Continuous scrolling view with zoom (Ctrl+Wheel), fit-width, page thumbnails.
-- Full-text search with match-case / whole-word and result highlighting.
-- Extract all text (copy or save as UTF-8 `.txt`).
-- View document metadata (title, author, producer, …).
-
-**Safe editing**
-- Snapshot-based unlimited **undo/redo** (Ctrl+Z / Ctrl+Y).
-- Saves via a temp file + atomic rename, so a failed write never truncates the original.
-- Opens password-protected PDFs (prompts for the password).
+**Forms and more**
+- Fill form fields, flatten forms and annotations, search, extract all text,
+  view metadata, open password-protected PDFs.
+- Unlimited undo / redo.
 
 ## Build
 
-Requires Visual Studio 2026 (v18) with the C++ and CMake components.
+### Windows
+
+Visual Studio 2026 with the C++ and CMake components:
 
 ```bat
-build.bat            :: Release (default)
+build.bat            :: Release
 build.bat Debug      :: Debug
 ```
 
-CMake downloads Dear ImGui (v1.91.5) and a pinned PDFium binary (SHA-256 verified)
-on the first configure. The result is:
+CMake downloads Dear ImGui and a pinned PDFium build (SHA-256 checked). Result:
+`build\bin\PdfEditor.exe` (with `pdfium.dll`). `PdfEditor.exe --selftest` runs
+the engine checks and writes `selftest.log`.
 
+### Android
+
+Android SDK (platform 34, NDK 27, CMake 3.22) and JDK 17:
+
+```bat
+cd android
+gradlew.bat assembleRelease
 ```
-build\bin\PdfEditor.exe   (+ pdfium.dll and licenses\ copied alongside)
-```
 
-Run `PdfEditor.exe --selftest` for a headless smoke test of the editing pipeline
-(writes `selftest.log`).
-
-## Usage
-
-- Open a PDF via **File ▸ Open**, drag-and-drop onto the window, or pass it on the
-  command line.
-- Pick a tool from the toolbar (Select, Text, Image, Rectangle, Redact, Pan).
-- Edit, then **File ▸ Save** / **Save As**.
+The app is in `android/` (Kotlin, Jetpack Compose); it compiles the shared
+engine from `src/` through `android/app/src/main/cpp`. Release builds are signed
+with the key named in `android/keystore.properties` (not part of the
+repository), otherwise with the debug key.
 
 ## Third-party
 
-- [PDFium](https://pdfium.googlesource.com/pdfium/) — BSD-3-Clause
+- [PDFium](https://pdfium.googlesource.com/pdfium/) - BSD-3-Clause
   (prebuilt by [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)).
-- [Dear ImGui](https://github.com/ocornut/imgui) — MIT.
+- [Dear ImGui](https://github.com/ocornut/imgui) - MIT.
+- Jetpack Compose / AndroidX - Apache-2.0.
 
 ## Note
 
-This is a general-purpose PDF editor. Edited documents are your own files —
-altering a statement, invoice or other record issued by someone else so it no
-longer matches their records is forgery; don't use it for that.
+This is a general-purpose PDF editor for your own documents. Changing a
+statement, invoice or other record that someone else issued so that it no
+longer matches their records is forgery - don't use it for that.

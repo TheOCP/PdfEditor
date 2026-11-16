@@ -192,7 +192,7 @@ static int RunUiShots(HWND hwnd, const std::wstring& dir, const std::wstring& pd
                     g_app.SelectAllOnPage(false);
                     g_app.toast.text.clear();
                 } else if (name == "toast") {
-                    g_app.Toasts(Fmt(T("%s is not in the font %s - drawn with %s instead"), "\"8\"", "AllAndNone", "Segoe UI Light"));
+                    g_app.Toasts(Fmt(T("%s is not in the font %s - drawn with %s instead"), "\"8\"", "DocFont", "Segoe UI Light"));
                 } else if (name == "help") g_app.showHelp = true;
                 else if (name == "settings") g_app.showSettings = true;
                 else if (name == "table") g_app.showTable = true;

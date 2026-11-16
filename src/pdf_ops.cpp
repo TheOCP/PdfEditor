@@ -745,7 +745,7 @@ static FPDF_FONT LoadFontFor(Document& d, const Bytes& data, const std::string& 
 
 // The installed font closest to a PDF font: the same family if installed,
 // otherwise picked by the font's own style flags (serif / monospace, weight,
-// italic), so a custom font like "AllAndNone" gets a look-alike, not Helvetica.
+// italic), so a custom document font gets a look-alike, not Helvetica.
 static FPDF_FONT StandInFont(Document& d, FPDF_FONT ref, const std::string& base) {
     bool exact = false;
     MatchSystemFont(base, &exact);
