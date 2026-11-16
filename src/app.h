@@ -133,8 +133,11 @@ public:
     void ForwardFormChar(unsigned int ch);
     void EndFormFocus();
 
+    // Font menu entries: fonts stored in the open PDF (most used first), then
+    // the 14 standard PDF fonts, then fonts installed on this PC.
     const std::vector<FontChoice>& FontList();
-    FontChoice CurrentFont();
+    FontChoice CurrentFont();                // resolves a live handle for PDF fonts
+    int docFontCount = 0;                    // how many entries at the top come from the PDF
 
     // ============================== state
     HWND hwnd_ = nullptr;
@@ -268,4 +271,6 @@ private:
     void UpdateTitle();
     std::vector<FontChoice> fontList_;
     bool fontListBuilt_ = false;
+    uint32_t fontListDoc_ = 0;
+    bool fontDefaultPending = true;   // a new PDF was opened: default to its most used font
 };

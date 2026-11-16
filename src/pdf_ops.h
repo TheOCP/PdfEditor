@@ -71,8 +71,45 @@ bool SetObjectText(Document& d, int page, FPDF_PAGEOBJECT obj, const std::wstrin
 // characters, the object is rebuilt with a matching installed font at the exact
 // same size, rotation and position. *replaced gets the object now holding the
 // text (== obj unless a fallback happened).
+// What happened when text was typed into a PDF font.
+struct TextEditInfo {
+    std::wstring missing;                  // characters the PDF's font doesn't contain
+    std::string fontName;                  // the PDF's font (subset prefix removed)
+    std::string standIn;                   // installed font drawing only the missing characters
+    bool otherCopy = false;                // another copy of the same font in this PDF had them all
+    std::vector<FPDF_PAGEOBJECT> pieces;   // every object now showing the text, left to right
+    int groupId = 0;                       // group tying the pieces together (0 = single object)
+};
+// Keeps the object's own font. Characters that font doesn't contain are taken
+// from another copy of the same font in the PDF if one has them; otherwise only
+// those characters are drawn in the closest installed font, sized to match, and
+// the rest stays in the PDF's font (the pieces are grouped and edit as one).
 bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::wstring& text,
-                       FPDF_PAGEOBJECT* replaced, bool* usedFallback);
+                       FPDF_PAGEOBJECT* replaced, bool* usedFallback, TextEditInfo* info = nullptr);
+// Text drawn in pieces by SetObjectTextSafe: all pieces of the text `obj`
+// belongs to, left to right (empty if it is a normal single object).
+std::vector<FPDF_PAGEOBJECT> TextPieces(Document& d, int page, FPDF_PAGEOBJECT obj);
+// Joins pieces back into one object (the first piece in the PDF's own font,
+// moved to where the text starts) so it can be edited as one. Returns it.
+FPDF_PAGEOBJECT JoinTextPieces(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>& pieces);
+// Changes only the size of a text object, keeping its font, spacing, colour
+// and clip (scales it about its start point). visualSize is in page points.
+bool SetTextVisualSize(Document& d, int page, FPDF_PAGEOBJECT obj, float visualSize);
+// PostScript name of the font a text object uses (subset prefix removed).
+std::string TextFontName(FPDF_PAGEOBJECT obj);
+
+// Fonts stored inside the open PDF, most used first.
+struct DocFont {
+    std::string name;        // BaseFont as written in the PDF (may carry an "ABCDEF+" subset prefix)
+    bool embedded = false;   // the font program is inside the PDF
+    bool subset = false;     // only the characters the PDF uses are included
+    int uses = 0;
+};
+std::vector<DocFont> ListDocFonts(Document& d, int maxPages = 40);
+// A live handle for a font stored in the PDF, taken from a text object that
+// uses it (searching `preferPage` first). Optionally returns that object.
+FPDF_FONT FindDocFont(Document& d, const std::string& name, int preferPage,
+                      FPDF_PAGEOBJECT* sample = nullptr, int* samplePage = nullptr);
 
 void SetObjectFillColor(Document& d, int page, FPDF_PAGEOBJECT obj, unsigned r, unsigned g, unsigned b, unsigned a);
 
@@ -84,7 +121,8 @@ FPDF_PAGEOBJECT AddText(Document& d, int page, const std::wstring& text, const F
 // in the same document) or else from raw font bytes / a matching installed font.
 FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPDF_PAGEOBJECT styleFrom,
                             const Bytes& fontData, const std::string& fontBase, double visualSize,
-                            float px, float py, unsigned r, unsigned g, unsigned b, std::string& err);
+                            float px, float py, unsigned r, unsigned g, unsigned b, std::string& err,
+                            TextEditInfo* info = nullptr);
 // Re-renders a text object in another font at `visualSize`, keeping position,
 // rotation, colour, stacking order and group tag.
 bool RestyleText(Document& d, int page, FPDF_PAGEOBJECT obj, const FontChoice& fc, double visualSize,

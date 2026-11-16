@@ -34,11 +34,16 @@ void MatApply(const FS_MATRIX& m, float x, float y, float& ox, float& oy);
 
 // Font picked in the UI: one of the 14 standard PDF fonts, or a TTF file.
 struct FontChoice {
-    std::string stdName;      // e.g. "Helvetica" (used when file is empty)
+    std::string stdName;      // e.g. "Helvetica" (used when file and docName are empty)
     std::wstring file;        // e.g. C:\Windows\Fonts\arial.ttf
+    std::string docName;      // a font stored inside the open PDF (its BaseFont name)
+    FPDF_FONT handle = nullptr;   // live handle for docName, resolved right before use
     std::string label;        // shown in the UI
-    bool IsStandard() const { return file.empty(); }
-    std::string Key() const { return file.empty() ? "std:" + stdName : "ttf:" + W2U(file); }
+    bool IsDoc() const { return !docName.empty(); }
+    bool IsStandard() const { return file.empty() && docName.empty(); }
+    std::string Key() const {
+        return IsDoc() ? "doc:" + docName : file.empty() ? "std:" + stdName : "ttf:" + W2U(file);
+    }
 };
 
 class Document;

@@ -21,18 +21,48 @@ void App::Shutdown() {
 }
 
 const std::vector<FontChoice>& App::FontList() {
-    if (!fontListBuilt_) {
-        fontList_ = StandardFonts();
+    uint32_t id = doc.Raw() ? doc.DocId() : 0;
+    if (!fontListBuilt_ || id != fontListDoc_) {
+        std::string prevKey = (fontIndex >= 0 && fontIndex < (int)fontList_.size()) ? fontList_[fontIndex].Key() : "";
+        fontList_.clear();
+        docFontCount = 0;
+        if (doc.Raw()) {
+            // Fonts stored in the PDF first (one entry per family; most used copy).
+            for (const auto& df : ops::ListDocFonts(doc)) {
+                std::string nm = StripSubsetPrefix(df.name);
+                bool dup = false;
+                for (auto& e : fontList_) if (StripSubsetPrefix(e.docName) == nm) { dup = true; break; }
+                if (dup || nm.empty()) continue;
+                FontChoice fc;
+                fc.docName = df.name;
+                fc.label = nm + (df.embedded ? "  (in this PDF)" : "  (used in this PDF)");
+                fontList_.push_back(fc);
+            }
+            docFontCount = (int)fontList_.size();
+        }
+        for (auto& f : StandardFonts()) fontList_.push_back(f);
         for (const auto& f : SystemFonts()) fontList_.push_back(ChoiceFor(f));
         fontListBuilt_ = true;
+        fontListDoc_ = id;
+        int keep = -1;
+        for (int i = 0; i < (int)fontList_.size() && !prevKey.empty(); ++i)
+            if (fontList_[i].Key() == prevKey) { keep = i; break; }
+        if (fontDefaultPending && docFontCount > 0) fontIndex = 0;   // new PDF: its most used font
+        else fontIndex = keep >= 0 ? keep : 0;
+        if (doc.Raw()) fontDefaultPending = false;
     }
     return fontList_;
 }
 
 FontChoice App::CurrentFont() {
     const auto& fl = FontList();
-    if (fontIndex < 0 || fontIndex >= (int)fl.size()) return fl.empty() ? FontChoice{} : fl[0];
-    return fl[fontIndex];
+    FontChoice fc = (fontIndex >= 0 && fontIndex < (int)fl.size()) ? fl[fontIndex] : (fl.empty() ? FontChoice{} : fl[0]);
+    if (fc.IsDoc()) {
+        fc.handle = ops::FindDocFont(doc, fc.docName, currentPage);
+        if (!fc.handle)                          // no longer used in the PDF: closest installed font
+            if (const SysFont* sf = MatchSystemFont(fc.docName)) return ChoiceFor(*sf);
+    }
+    return fc;
 }
 
 void App::Toasts(const std::string& msg, bool error) {
@@ -84,6 +114,7 @@ void App::ResetAfterLoad() {
     searchCurrent = -1;
     pendingFontValid = false;
     pasteCount = 0;
+    fontDefaultPending = true;               // default to the new PDF's own font
 }
 
 void App::NewDoc() {

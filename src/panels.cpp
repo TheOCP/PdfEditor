@@ -289,6 +289,7 @@ void App::DrawProperties() {
         if (ImGui::BeginCombo("##font", cur)) {
             for (int i = 0; i < (int)fl.size(); ++i) {
                 bool on = (i == fontIndex);
+                if (i == docFontCount && docFontCount > 0) ImGui::Separator();
                 if (ImGui::Selectable(fl[i].label.c_str(), on)) fontIndex = i;
                 if (on) ImGui::SetItemDefaultFocus();
             }
@@ -364,7 +365,11 @@ void App::DrawProperties() {
                 double visual = tp.fontSize * ops::MatrixScale(sel.accum);
                 ImGui::Separator();
                 ImGui::TextWrapped("Font: %s%s", tp.fontName.empty() ? "(unnamed)" : StripSubsetPrefix(tp.fontName).c_str(),
-                                   tp.embedded ? "  (embedded)" : "");
+                                   tp.embedded ? "  (stored in this PDF)" : "  (not stored - uses this PC's font)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stored in this PDF = the font file is inside the PDF itself, not installed in\n"
+                                      "Windows. Usually only the characters the PDF uses are included.\n"
+                                      "It is listed at the top of the font lists while this PDF is open.");
                 ImGui::Text("Size: %.1f pt", visual);
                 if (ImGui::Button("Edit text  (Enter)")) {
                     EnsureSelectionEditable();
@@ -383,24 +388,40 @@ void App::DrawProperties() {
                     static float newSize = 0;
                     if (newSize <= 0 || ImGui::IsWindowAppearing()) newSize = (float)visual;
                     const auto& fl = FontList();
+                    static int rIdx = -1;                 // -1 = keep the text's own font
+                    if (rIdx >= (int)fl.size()) rIdx = -1;
+                    std::string keepLbl = "Keep current font (" + StripSubsetPrefix(tp.fontName) + ")";
                     ImGui::SetNextItemWidth(-1);
-                    const char* curf = (fontIndex >= 0 && fontIndex < (int)fl.size()) ? fl[fontIndex].label.c_str() : "(none)";
-                    if (ImGui::BeginCombo("##rf", curf)) {
-                        for (int i = 0; i < (int)fl.size(); ++i)
-                            if (ImGui::Selectable(fl[i].label.c_str(), i == fontIndex)) fontIndex = i;
+                    if (ImGui::BeginCombo("##rf", rIdx < 0 ? keepLbl.c_str() : fl[rIdx].label.c_str())) {
+                        if (ImGui::Selectable(keepLbl.c_str(), rIdx < 0)) rIdx = -1;
+                        ImGui::Separator();
+                        for (int i = 0; i < (int)fl.size(); ++i) {
+                            if (i == docFontCount && docFontCount > 0) ImGui::Separator();
+                            if (ImGui::Selectable(fl[i].label.c_str(), i == rIdx)) rIdx = i;
+                        }
                         ImGui::EndCombo();
                     }
                     ImGui::SetNextItemWidth(-1);
                     ImGui::DragFloat("##rs", &newSize, 0.2f, 2.0f, 300.0f, "Size %.1f pt");
                     if (ImGui::Button("Apply")) {
                         EnsureSelectionEditable();
-                        std::string err;
-                        FPDF_PAGEOBJECT out = nullptr;
-                        if (ops::RestyleText(doc, sel.page, sel.obj, CurrentFont(), newSize, err, &out)) {
-                            SelectNewObject(sel.page, out);
-                            InvalidatePage(sel.page);
-                            CommitIfDirty("Change font");
-                        } else Toasts("Could not change the font: " + err, true);
+                        if (rIdx < 0) {                   // size only: font, spacing and colour untouched
+                            float sc = ops::MatrixScale(sel.accum);
+                            if (ops::SetTextVisualSize(doc, sel.page, sel.obj, newSize / (sc > 0 ? sc : 1.0f))) {
+                                InvalidatePage(sel.page);
+                                CommitIfDirty("Change size");
+                            }
+                        } else {
+                            FontChoice fc = fl[rIdx];
+                            if (fc.IsDoc()) fc.handle = ops::FindDocFont(doc, fc.docName, sel.page);
+                            std::string err;
+                            FPDF_PAGEOBJECT out = nullptr;
+                            if (ops::RestyleText(doc, sel.page, sel.obj, fc, newSize, err, &out)) {
+                                SelectNewObject(sel.page, out);
+                                InvalidatePage(sel.page);
+                                CommitIfDirty("Change font");
+                            } else Toasts("Could not change the font: " + err, true);
+                        }
                     }
                     ImGui::TreePop();
                 }

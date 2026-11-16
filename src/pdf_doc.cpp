@@ -449,6 +449,10 @@ void Document::DevToPage(int i, float s, float dx, float dy, float& px, float& p
 
 FPDF_FONT Document::GetFont(const FontChoice& fc, std::string& err) {
     if (!doc_) return nullptr;
+    // Fonts stored in the PDF are used through a live handle and never cached:
+    // the handle belongs to the page objects that use it.
+    if (fc.handle) return fc.handle;
+    if (fc.IsDoc()) { err = "that font is no longer used anywhere in this PDF"; return nullptr; }
     std::string key = fc.Key();
     auto it = fonts_.find(key);
     if (it != fonts_.end()) return it->second;
