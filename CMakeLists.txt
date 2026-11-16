@@ -47,6 +47,7 @@ add_executable(PdfEditor WIN32
     src/gfx.cpp
     src/i18n.cpp
     src/selftest.cpp
+    src/system.cpp
     res/app.rc
     res/app.manifest
 

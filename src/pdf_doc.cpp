@@ -419,7 +419,7 @@ bool Document::Redo() {
 }
 
 bool Document::Render(int i, float scale, int rx, int ry, int rw, int rh, std::vector<uint32_t>& out,
-                      bool annots, bool forms) {
+                      bool annots, bool forms, bool printing) {
     FPDF_PAGE p = Page(i);
     if (!p || rw <= 0 || rh <= 0) return false;
     FS_SIZEF sz = PageSizePt(i);
@@ -428,7 +428,7 @@ bool Document::Render(int i, float scale, int rx, int ry, int rw, int rh, std::v
     out.assign((size_t)rw * rh, 0xFFFFFFFFu);
     FPDF_BITMAP bmp = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA, out.data(), rw * 4);
     if (!bmp) return false;
-    int flags = annots ? FPDF_ANNOT : 0;
+    int flags = (annots ? FPDF_ANNOT : 0) | (printing ? FPDF_PRINTING : 0);
     FPDF_RenderPageBitmap(bmp, p, -rx, -ry, fw, fh, 0, flags);
     if (forms && form_) FPDF_FFLDraw(form_, bmp, p, -rx, -ry, fw, fh, 0, flags);
     FPDFBitmap_Destroy(bmp);

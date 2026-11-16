@@ -1,4 +1,5 @@
 #include "app.h"
+#include "system.h"
 #include "dialogs.h"
 #include "i18n.h"
 #include "icons.h"
@@ -86,6 +87,7 @@ void App::DrawMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem(T("Save"), K("Ctrl+S"), false, has)) Save();
         if (ImGui::MenuItem(T("Save As..."), K("Ctrl+Shift+S"), false, has)) SaveAs();
+        if (ImGui::MenuItem(T("Print..."), K("Ctrl+P"), false, has)) Print();
         ImGui::Separator();
         if (ImGui::MenuItem(T("Import pages from another PDF..."), nullptr, false, has)) {
             std::wstring f;
@@ -174,6 +176,7 @@ void App::DrawMenuBar() {
             if (ImGui::MenuItem("Deutsch", nullptr, Language() == Lang::German)) ChangeLanguage(Lang::German);
             ImGui::EndMenu();
         }
+        if (ImGui::MenuItem(T("Make PDF Editor the default PDF app..."))) MakeDefaultPdfApp();
         ImGui::Separator();
         if (ImGui::MenuItem(T("Settings..."))) showSettings = true;
         ImGui::EndMenu();
@@ -245,6 +248,7 @@ void App::DrawToolbar() {
         auto add = [&](float x) { w += x + sp; };
         add(ToolbarButtonWidth(ICON_OPEN, T("Open"), labels));
         add(ToolbarButtonWidth(ICON_SAVE, T("Save"), labels));
+        add(ToolbarButtonWidth(ICON_PRINT, T("Print"), false));
         w += gap;
         add(ToolbarButtonWidth(ICON_UNDO, T("Undo"), false));
         add(ToolbarButtonWidth(ICON_REDO, T("Redo"), false));
@@ -275,6 +279,7 @@ void App::DrawToolbar() {
 
     if (button(ICON_OPEN, T("Open"), labels, false, K("Ctrl+O"))) OpenDialog();
     if (button(ICON_SAVE, T("Save"), labels, false, K("Ctrl+S"), has)) Save();
+    if (button(ICON_PRINT, T("Print"), false, false, K("Ctrl+P"), has)) Print();
     spacer();
     if (button(ICON_UNDO, T("Undo"), false, false, K("Ctrl+Z"), doc.CanUndo())) Undo();
     if (button(ICON_REDO, T("Redo"), false, false, K("Ctrl+Y"), doc.CanRedo())) Redo();
@@ -1054,6 +1059,16 @@ void App::DrawModals() {
             for (int pct : kSizes)
                 if (ImGui::Selectable(sizeLabel(pct).c_str(), pct == cur)) ChangeUiScale(pct / 100.0f);
             ImGui::EndCombo();
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted(T("Default PDF app"));
+        static double checkedAt = -10;
+        static bool isDefault = false;
+        if (ImGui::GetTime() - checkedAt > 2.0) { isDefault = !uiShotOpenAll && IsDefaultPdfApp(); checkedAt = ImGui::GetTime(); }
+        if (isDefault) {
+            ImGui::TextDisabled("%s", T("PDF files open with PDF Editor"));
+        } else if (ImGui::Button(T("Make PDF Editor the default PDF app..."))) {
+            MakeDefaultPdfApp();
         }
         ImGui::Spacing();
         if (ImGui::Button(T("Close"), ImVec2(ButtonWidth(T("Close"), 100 * s), 0))) ImGui::CloseCurrentPopup();

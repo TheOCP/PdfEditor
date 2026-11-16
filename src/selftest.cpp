@@ -5,6 +5,7 @@
 #include "pdf_ops.h"
 #include "sysfonts.h"
 #include "imageio.h"
+#include "system.h"
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -634,6 +635,75 @@ int RunSelfTest() {
             auto ys2 = rowsY(all);
             Check(ys2[0] < ys2[1] && got.b < ys2[1], "keep spacing: an edge never crosses an inner line");
         }
+    }
+
+    // ---- printing (to "Microsoft Print to PDF", no dialog) ----
+    Out("\nPrinting:\n");
+    {
+        HDC pdc = CreateDCW(L"WINSPOOL", L"Microsoft Print to PDF", nullptr, nullptr);
+        if (!pdc) {
+            Out("  (no \"Microsoft Print to PDF\" printer - skipped)\n");
+        } else {
+            Document pdoc;
+            pdoc.CreateBlank(595, 842);
+            ops::InsertBlankPage(pdoc, 1, 842, 595);                    // a landscape page
+            FontChoice fc; fc.stdName = "Helvetica";
+            std::string e;
+            ops::AddText(pdoc, 0, L"Printed page one", fc, 28, 72, 700, 0, 0, 0, e);
+            ops::AddText(pdoc, 1, L"Landscape page", fc, 28, 72, 500, 0, 0, 0, e);
+            pdoc.Commit("print test");
+            wchar_t tmp[MAX_PATH] = {};
+            GetTempPathW(MAX_PATH, tmp);
+            std::wstring out = std::wstring(tmp) + L"pdfeditor-print-test.pdf";
+            DeleteFileW(out.c_str());
+            PrintResult pr = PrintPages(pdc, pdoc, { 0, 1 }, 1, L"print test", out.c_str());
+            DeleteDC(pdc);
+            Check(pr.printed && pr.pages == 2, "printed both pages");
+            Document back;
+            std::string be;
+            bool loaded = false;
+            for (int t = 0; t < 50 && !loaded; ++t) {               // the spooler writes the file
+                loaded = back.LoadFile(out, "", be) == Document::Load::Ok;
+                if (!loaded) Sleep(100);
+            }
+            Check(loaded && back.PageCount() == 2, "printout has 2 pages");
+            if (loaded && back.PageCount() == 2) {
+                auto ink = [&](int pg) {
+                    FS_SIZEF z = back.PageSizePt(pg);
+                    std::vector<uint32_t> px;
+                    int w = (int)(z.width / 2), h = (int)(z.height / 2);
+                    back.Render(pg, 0.5f, 0, 0, w, h, px);
+                    int dark = 0;
+                    for (uint32_t c : px) if (((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF)) < 300) ++dark;
+                    return dark;
+                };
+                Check(ink(0) > 50 && ink(1) > 50, "printed pages carry the text");
+                FS_SIZEF z0 = back.PageSizePt(0);
+                Check(z0.height > z0.width, "printed on portrait paper (landscape page turned to fit)");
+            }
+            back.Close();
+            DeleteFileW(out.c_str());
+        }
+    }
+
+    // ---- default PDF app registration (scratch registry key) ----
+    Out("\nDefault PDF app registration:\n");
+    {
+        const std::wstring base = L"Software\\PdfEditorSelfTest";
+        RegDeleteTreeW(HKEY_CURRENT_USER, base.c_str());
+        std::string err;
+        bool ok = RegisterPdfApp(base, L"C:\\Apps\\PdfEditor.exe", err);
+        Check(ok, "registration written");
+        wchar_t buf[512] = {};
+        DWORD cb = sizeof(buf);
+        LONG rc = RegGetValueW(HKEY_CURRENT_USER, (base + L"\\Classes\\PdfEditor.PDF\\shell\\open\\command").c_str(),
+                               nullptr, RRF_RT_REG_SZ, nullptr, buf, &cb);
+        Check(rc == ERROR_SUCCESS && std::wstring(buf) == L"\"C:\\Apps\\PdfEditor.exe\" \"%1\"", "open command passes the file");
+        cb = sizeof(buf);
+        rc = RegGetValueW(HKEY_CURRENT_USER, (base + L"\\TheOCProductions\\PdfEditor\\Capabilities\\FileAssociations").c_str(),
+                          L".pdf", RRF_RT_REG_SZ, nullptr, buf, &cb);
+        Check(rc == ERROR_SUCCESS && std::wstring(buf) == L"PdfEditor.PDF", "listed as a PDF app for Windows Settings");
+        RegDeleteTreeW(HKEY_CURRENT_USER, base.c_str());
     }
 
     // ---- text baseline for alignment ----

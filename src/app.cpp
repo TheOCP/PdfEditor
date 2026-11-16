@@ -1,5 +1,6 @@
 #include "app.h"
 #include "dialogs.h"
+#include "system.h"
 #include "i18n.h"
 #include "icons.h"
 #include "theme.h"
@@ -429,6 +430,7 @@ void App::Draw() {
     if (io.KeyCtrl && !typing) {
         if (ImGui::IsKeyPressed(ImGuiKey_S)) { if (io.KeyShift) SaveAs(); else Save(); }
         if (ImGui::IsKeyPressed(ImGuiKey_O)) OpenDialog();
+        if (ImGui::IsKeyPressed(ImGuiKey_P) && doc.Raw()) Print();
         if (ImGui::IsKeyPressed(ImGuiKey_N)) NewDoc();
         if (ImGui::IsKeyPressed(ImGuiKey_Z)) Undo();
         if (ImGui::IsKeyPressed(ImGuiKey_Y)) Redo();
@@ -441,4 +443,24 @@ void App::Draw() {
         if (ImGui::IsKeyPressed(ImGuiKey_0) || ImGui::IsKeyPressed(ImGuiKey_Keypad0)) fitPending = true;
         if (ImGui::IsKeyPressed(ImGuiKey_1) || ImGui::IsKeyPressed(ImGuiKey_Keypad1)) { zoom = 96.0f / 72.0f; InvalidateAll(); }
     }
+}
+
+// ------------------------------------------------------------------ printing
+
+void App::Print() {
+    if (!doc.Raw()) return;
+    if (editing) CommitInlineEdit();
+    std::wstring title = doc.path.empty() ? std::wstring(L"PDF") : doc.path.substr(doc.path.find_last_of(L"\\/") + 1);
+    PrintResult r = PrintDocument(hwnd_, doc, currentPage, title);
+    if (r.printed) Toasts(Fmt(T("Sent %d page(s) to the printer"), r.pages));
+    else if (!r.cancelled && !r.error.empty()) Toasts(std::string(T("Printing failed: ")) + T(r.error), true);
+}
+
+// ------------------------------------------------------- default PDF app
+
+void App::MakeDefaultPdfApp() {
+    std::string err;
+    if (!RegisterPdfApp(L"Software", ThisExePath(), err)) { Toasts(std::string(T("Could not register: ")) + T(err), true); return; }
+    OpenDefaultAppSettings();
+    Toasts(T("In Windows Settings, set PDF Editor as the default for .pdf"));
 }

@@ -2,6 +2,15 @@ package com.theocp.pdfeditor
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PrintManager
+import java.io.FileOutputStream
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
@@ -167,7 +176,8 @@ class MainActivity : ComponentActivity(), Host {
     private fun openUri(uri: Uri, keep: Boolean, canWrite: Boolean = false) {
         lifecycleScope.launch {
             ed.busy = true
-            val writable = if (keep) persist(uri, write = true) else canWrite
+            val writable = if (keep) persist(uri, write = true) else canWrite ||
+                checkCallingOrSelfUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED
             val name = displayName(uri)
             val bytes = withContext(Dispatchers.IO) { readBytes(uri) }
             ed.busy = false
@@ -218,6 +228,35 @@ class MainActivity : ComponentActivity(), Host {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         startActivity(Intent.createChooser(send, tr("Share")))
+    }
+
+    /** Android's print screen (printers, "Save as PDF") with the document as it is now. */
+    override fun print() {
+        val bytes = Engine.nSave() ?: run { ed.toast(tr("Could not save"), true); return }
+        val name = suggestedName()
+        val pages = ed.pageCount
+        val pm = getSystemService(Context.PRINT_SERVICE) as PrintManager
+        pm.print(name, object : PrintDocumentAdapter() {
+            override fun onLayout(oldAttributes: PrintAttributes?, newAttributes: PrintAttributes,
+                                  cancellationSignal: CancellationSignal, callback: LayoutResultCallback, extras: Bundle?) {
+                if (cancellationSignal.isCanceled) { callback.onLayoutCancelled(); return }
+                val info = PrintDocumentInfo.Builder(name)
+                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                    .setPageCount(pages)
+                    .build()
+                callback.onLayoutFinished(info, oldAttributes == null)
+            }
+
+            override fun onWrite(range: Array<out PageRange>, destination: ParcelFileDescriptor,
+                                 cancellationSignal: CancellationSignal, callback: WriteResultCallback) {
+                try {
+                    FileOutputStream(destination.fileDescriptor).use { it.write(bytes) }
+                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))     // the print screen picks the pages
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.message)
+                }
+            }
+        }, null)
     }
 
     /** Every page as a PNG (2x = 144 dpi) into the chosen folder. */

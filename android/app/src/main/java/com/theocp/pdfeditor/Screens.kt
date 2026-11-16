@@ -281,6 +281,7 @@ private fun EditorTopBar(ed: Editor, compact: Boolean) {
                         item(tr("Text & shape style")) { ed.showProps = true }
                     }
                     item(tr("Save a copy...")) { ed.host.saveAs() }
+                    item(tr("Print")) { ed.host.print() }
                     item(tr("Share")) { ed.host.share() }
                     HorizontalDivider(color = C.Line)
                     item(tr("Pages")) { ed.showPages = true }

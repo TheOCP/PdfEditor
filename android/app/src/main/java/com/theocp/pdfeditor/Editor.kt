@@ -40,6 +40,7 @@ interface Host {
     fun saveAs()
     fun exportPages()
     fun share()
+    fun print()
     fun write(uri: Uri, bytes: ByteArray): Boolean
 }
 

@@ -72,6 +72,8 @@ public:
     void FlattenCurrentPage();
     void ExportImagesDialog(float dpi);
     void ExtractTextDialog();
+    void Print();                                // Windows print dialog
+    void MakeDefaultPdfApp();                    // register + open Windows default-app settings
     void Toasts(const std::string& msg, bool error = false);
     void ChangeLanguage(Lang l, bool save = true);   // applies right away, remembered
     void DrawWelcome(ImVec2 origin, ImVec2 region);  // start screen (no document open)

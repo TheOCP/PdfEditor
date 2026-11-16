@@ -101,7 +101,7 @@ public:
     // ---- rendering: BGRA of the device rect (rx,ry,rw,rh) of the page drawn at
     // `scale` device pixels per PDF point.
     bool Render(int i, float scale, int rx, int ry, int rw, int rh, std::vector<uint32_t>& out,
-                bool annots = true, bool forms = true);
+                bool annots = true, bool forms = true, bool printing = false);
 
     // ---- page space <-> device pixels (page origin at 0,0) at `scale`
     void PageToDev(int i, float scale, float px, float py, float& dx, float& dy);
