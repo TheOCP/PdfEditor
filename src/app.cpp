@@ -1,11 +1,16 @@
 #include "app.h"
 #include "dialogs.h"
+#include "i18n.h"
+#include "icons.h"
+#include "theme.h"
 #include "imgui.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <fpdf_signature.h>
 
-static const std::vector<FileFilter> kPdfFilter = { { L"PDF documents", L"*.pdf" }, { L"All files", L"*.*" } };
+static std::vector<FileFilter> PdfFilter() {
+    return { { TW("PDF documents"), L"*.pdf" }, { TW("All files"), L"*.*" } };
+}
 
 void App::Init(HWND hwnd) {
     hwnd_ = hwnd;
@@ -20,9 +25,23 @@ void App::Shutdown() {
     doc.Close();            // before PdfShutdown(); the static App would otherwise close it too late
 }
 
+void App::ChangeLanguage(Lang l, bool save) {
+    SetLanguage(l);
+    if (!save) { fontListBuilt_ = false; lastTitle.clear(); return; }
+    SaveSettings();
+    fontListBuilt_ = false;          // font labels are translated
+    lastTitle.clear();
+}
+
+void App::ChangeUiScale(float factor) {
+    SetUiScaleSetting(factor);
+    SaveSettings();
+    uiScaleChanged = true;           // the window host rebuilds the fonts between frames
+}
+
 const std::vector<FontChoice>& App::FontList() {
     uint32_t id = doc.Raw() ? doc.DocId() : 0;
-    if (!fontListBuilt_ || id != fontListDoc_) {
+    if (!fontListBuilt_ || id != fontListDoc_ || fontListLang_ != LanguageGeneration()) {
         std::string prevKey = (fontIndex >= 0 && fontIndex < (int)fontList_.size()) ? fontList_[fontIndex].Key() : "";
         fontList_.clear();
         docFontCount = 0;
@@ -35,15 +54,19 @@ const std::vector<FontChoice>& App::FontList() {
                 if (dup || nm.empty()) continue;
                 FontChoice fc;
                 fc.docName = df.name;
-                fc.label = nm + (df.embedded ? "  (in this PDF)" : "  (used in this PDF)");
+                fc.label = nm + (df.embedded ? T("  (in this PDF)") : T("  (used in this PDF)"));
                 fontList_.push_back(fc);
             }
             docFontCount = (int)fontList_.size();
         }
-        for (auto& f : StandardFonts()) fontList_.push_back(f);
+        for (auto f : StandardFonts()) {
+            f.label = f.stdName + T("  (standard, not embedded)");
+            fontList_.push_back(f);
+        }
         for (const auto& f : SystemFonts()) fontList_.push_back(ChoiceFor(f));
         fontListBuilt_ = true;
         fontListDoc_ = id;
+        fontListLang_ = LanguageGeneration();
         int keep = -1;
         for (int i = 0; i < (int)fontList_.size() && !prevKey.empty(); ++i)
             if (fontList_[i].Key() == prevKey) { keep = i; break; }
@@ -86,7 +109,7 @@ FPDF_PAGEOBJECT App::AddTextInFont(int page, const std::wstring& text, double si
 void App::Toasts(const std::string& msg, bool error) {
     toast.text = msg;
     toast.error = error;
-    toast.until = ImGui::GetTime() + (error ? 6.0 : 4.0);
+    toast.until = ImGui::GetTime() + (error ? 6.0 : 3.5);
 }
 
 void App::InvalidatePage(int i) {
@@ -110,9 +133,9 @@ bool App::ConfirmDiscard() {
     if (editing) CommitInlineEdit();
     EndFormFocus();
     if (!doc.Raw() || !doc.modified) return true;
-    std::wstring msg = L"Save changes to \"" + (doc.displayName.empty() ? std::wstring(L"Untitled.pdf") : doc.displayName) +
-                       L"\" first?";
-    int r = MessageBoxW(hwnd_, msg.c_str(), L"PDF Editor", MB_YESNOCANCEL | MB_ICONWARNING);
+    std::string name = doc.displayName.empty() ? std::string(T("Untitled.pdf")) : W2U(doc.displayName);
+    std::wstring msg = U2W(Fmt(T("Save changes to \"%s\" first?"), name.c_str()));
+    int r = MessageBoxW(hwnd_, msg.c_str(), TW("PDF Editor").c_str(), MB_YESNOCANCEL | MB_ICONWARNING);
     if (r == IDCANCEL) return false;
     if (r == IDYES) return Save();
     return true;
@@ -130,6 +153,7 @@ void App::ResetAfterLoad() {
     thumbs.clear();
     searchHits.clear();
     searchCurrent = -1;
+    searchedFor.clear();
     pendingFontValid = false;
     pasteCount = 0;
     fontDefaultPending = true;               // default to the new PDF's own font
@@ -140,15 +164,15 @@ void App::NewDoc() {
     ClearLimbo();
     if (doc.CreateBlank(612, 792)) {
         ResetAfterLoad();
-        Toasts("New blank document");
+        Toasts(T("New blank document"));
     } else {
-        Toasts("Could not create a new document", true);
+        Toasts(T("Could not create a new document"), true);
     }
 }
 
 void App::OpenDialog() {
     std::wstring path;
-    if (OpenFileDialog(hwnd_, kPdfFilter, path)) OpenPath(path);   // OpenPath asks about unsaved changes
+    if (OpenFileDialog(hwnd_, PdfFilter(), path)) OpenPath(path);   // OpenPath asks about unsaved changes
 }
 
 void App::OpenPath(const std::wstring& path) {
@@ -164,14 +188,15 @@ void App::OpenPath(const std::wstring& path) {
         return;
     }
     if (r != Document::Load::Ok) {
-        ErrorBox(hwnd_, L"Could not open this PDF:\n" + U2W(err));
+        ErrorBox(hwnd_, TW("Could not open this PDF:") + L"\n" + U2W(T(err)));
         return;
     }
     ResetAfterLoad();
+    std::string name = W2U(doc.displayName);
     if (FPDF_GetSignatureCount(doc.Raw()) > 0)
-        Toasts("Opened " + W2U(doc.displayName) + " - note: it is digitally signed; any edit invalidates the signature");
+        Toasts(Fmt(T("Opened %s - note: it is digitally signed; any edit invalidates the signature"), name.c_str()));
     else
-        Toasts("Opened " + W2U(doc.displayName));
+        Toasts(Fmt(T("Opened %s"), name.c_str()));
 }
 
 bool App::Save() {
@@ -181,26 +206,26 @@ bool App::Save() {
     std::string err;
     doc.KillFormFocus();
     if (!doc.SaveFile(doc.path, false, false, err)) {
-        ErrorBox(hwnd_, L"Save failed:\n" + U2W(err));
+        ErrorBox(hwnd_, TW("Save failed:") + L"\n" + U2W(T(err)));
         return false;
     }
-    Toasts("Saved " + W2U(doc.displayName));
+    Toasts(Fmt(T("Saved %s"), W2U(doc.displayName).c_str()));
     return true;
 }
 
 bool App::SaveAs() {
     if (!doc.Raw()) return false;
     if (editing) CommitInlineEdit();
-    std::wstring name = doc.displayName.empty() ? L"document.pdf" : doc.displayName;
+    std::wstring name = doc.displayName.empty() ? TW("document.pdf") : doc.displayName;
     std::wstring out;
-    if (!SaveFileDialog(hwnd_, kPdfFilter, name.c_str(), L"pdf", out)) return false;
+    if (!SaveFileDialog(hwnd_, PdfFilter(), name.c_str(), L"pdf", out)) return false;
     std::string err;
     doc.KillFormFocus();
     if (!doc.SaveFile(out, false, false, err)) {
-        ErrorBox(hwnd_, L"Save failed:\n" + U2W(err));
+        ErrorBox(hwnd_, TW("Save failed:") + L"\n" + U2W(T(err)));
         return false;
     }
-    Toasts("Saved " + W2U(doc.displayName));
+    Toasts(Fmt(T("Saved %s"), W2U(doc.displayName).c_str()));
     return true;
 }
 
@@ -212,7 +237,7 @@ void App::Undo() {
         ClearSelection();
         InvalidateAll();
         searchDirty = true;
-        Toasts("Undo");
+        Toasts(T("Undone"));
     }
 }
 
@@ -224,24 +249,24 @@ void App::Redo() {
         ClearSelection();
         InvalidateAll();
         searchDirty = true;
-        Toasts("Redo");
+        Toasts(T("Redone"));
     }
 }
 
 void App::DoFlatten() {
     if (!doc.Raw()) return;
     if (AskYesNoCancel(hwnd_,
-            L"Flatten merges all form fields and annotations into the page content.\n"
-            L"Afterwards they can no longer be edited as fields. Continue?",
-            L"Flatten") != IDYES)
+            TW("Flatten merges all form fields and annotations into the page content.\n"
+               "Afterwards they can no longer be edited as fields. Continue?").c_str(),
+            TW("Flatten").c_str()) != IDYES)
         return;
     EndFormFocus();
     if (ops::FlattenAll(doc)) {
         ClearSelection();
         CommitIfDirty("Flatten");
-        Toasts("Flattened annotations and form fields");
+        Toasts(T("Flattened annotations and form fields"));
     } else {
-        Toasts("Nothing to flatten", true);
+        Toasts(T("Nothing to flatten"), true);
     }
 }
 
@@ -252,23 +277,23 @@ void App::FlattenCurrentPage() {
     if (ops::FlattenPage(doc, pg)) {
         ClearSelection();
         CommitIfDirty("Annotations to content");
-        Toasts(Fmt("Page %d: annotations are now normal content - click them to edit, split or move", pg + 1));
+        Toasts(Fmt(T("Page %d: annotations are now normal content - click them to edit, split or move"), pg + 1));
     } else {
-        Toasts("This page has no annotations to convert", true);
+        Toasts(T("This page has no annotations to convert"), true);
     }
 }
 
 void App::ExportImagesDialog(float dpi) {
     if (!doc.Raw()) return;
     std::wstring dir;
-    if (!PickFolderDialog(hwnd_, dir, L"Choose a folder for the page images")) return;
+    if (!PickFolderDialog(hwnd_, dir, TW("Choose a folder for the page images").c_str())) return;
     std::vector<int> pages;
     for (int i = 0; i < doc.PageCount(); ++i) pages.push_back(i);
     std::string err;
     if (ops::ExportPagesToImages(doc, pages, dir, dpi, err))
-        Toasts(Fmt("Exported %d page image(s) at %.0f DPI", (int)pages.size(), dpi));
+        Toasts(Fmt(T("Exported %d page image(s) at %.0f DPI"), (int)pages.size(), dpi));
     else
-        Toasts("Export failed: " + err, true);
+        Toasts(std::string(T("Export failed: ")) + T(err), true);
 }
 
 void App::ExtractTextDialog() {
@@ -278,8 +303,10 @@ void App::ExtractTextDialog() {
 }
 
 void App::UpdateTitle() {
-    std::wstring t = L"PDF Editor";
-    if (doc.Raw()) t = (doc.displayName.empty() ? L"Untitled.pdf" : doc.displayName) + (doc.modified ? L" *" : L"") + L" - PDF Editor";
+    std::wstring app = TW("PDF Editor");
+    std::wstring t = app;
+    if (doc.Raw())
+        t = (doc.displayName.empty() ? TW("Untitled.pdf") : doc.displayName) + (doc.modified ? L" *" : L"") + L" - " + app;
     if (t != lastTitle) {
         SetWindowTextW(hwnd_, t.c_str());
         lastTitle = t;
@@ -288,8 +315,23 @@ void App::UpdateTitle() {
 
 // --------------------------------------------------------------- frame
 
+// A thin vertical bar between two panels; dragging it resizes the panel.
+// `sign` +1: dragging right makes the panel wider (left panel), -1: narrower.
+static void Splitter(const char* id, float& width, float sign, float h, float dpi) {
+    float w = 6.0f * dpi;
+    ImGui::InvisibleButton(id, ImVec2(w, h));
+    bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive()) width += ImGui::GetIO().MouseDelta.x * sign;
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    float x = (a.x + b.x) * 0.5f;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(x, a.y), ImVec2(x, b.y),
+                                        hot ? theme::AccentU32 : ImGui::GetColorU32(theme::Line), hot ? 2.0f * dpi : 1.0f);
+}
+
 void App::Draw() {
     UpdateTitle();
+    float s = dpiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -297,30 +339,57 @@ void App::Draw() {
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10 * s, 7 * s));   // roomier menu bar
     ImGui::Begin("##root", nullptr, flags);
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(3);
 
     DrawMenuBar();
     DrawToolbar();
     DrawSearchBar();
 
-    float propsW = showProps ? 330.0f * dpiScale : 0.0f;
-    float thumbsW = showThumbs ? 180.0f * dpiScale : 0.0f;
+    // Panels follow the window size: sensible proportions, draggable
+    // dividers, and on narrow windows the page list steps aside so the page
+    // itself keeps enough room.
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (showThumbs) {
-        ImGui::BeginChild("##thumbs", ImVec2(thumbsW, avail.y), ImGuiChildFlags_Borders);
+    float split = 6.0f * s;
+    bool open = doc.Raw() != nullptr;                // start screen: just the page area
+    bool thumbsOn = open && showThumbs && avail.x >= 760 * s;
+    bool propsOn = open && showProps && avail.x >= 520 * s;
+    float thumbsW = 0, propsW = 0;
+    if (thumbsOn) {
+        float want = thumbsWUser > 0 ? thumbsWUser : std::clamp(avail.x * 0.11f, 120 * s, 200 * s);
+        thumbsW = std::clamp(want, 96 * s, std::max(96 * s, avail.x * 0.3f));
+    }
+    if (propsOn) {
+        float want = propsWUser > 0 ? propsWUser : std::clamp(avail.x * 0.24f, 270 * s, 400 * s);
+        propsW = std::clamp(want, 220 * s, std::max(220 * s, avail.x * 0.45f));
+    }
+    float minCanvas = 260 * s;
+    float used = thumbsW + propsW + (thumbsOn ? split : 0) + (propsOn ? split : 0);
+    if (avail.x - used < minCanvas && propsOn) propsW = std::max(200 * s, propsW - (minCanvas - (avail.x - used)));
+
+    if (thumbsOn) {
+        ImGui::BeginChild("##thumbs", ImVec2(thumbsW, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding);
         DrawThumbnails();
         ImGui::EndChild();
         ImGui::SameLine(0, 0);
+        float w = thumbsW;
+        Splitter("##splitL", w, +1.0f, avail.y, s);
+        if (w != thumbsW) thumbsWUser = w;
+        ImGui::SameLine(0, 0);
     }
-    float canvasW = std::max(50.0f, avail.x - thumbsW - propsW);
+    float canvasW = std::max(50.0f, avail.x - thumbsW - propsW - (thumbsOn ? split : 0) - (propsOn ? split : 0));
     ImGui::BeginChild("##canvas", ImVec2(canvasW, avail.y), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DrawCanvas();
     ImGui::EndChild();
-    if (showProps) {
+    if (propsOn) {
         ImGui::SameLine(0, 0);
-        ImGui::BeginChild("##props", ImVec2(propsW, avail.y), ImGuiChildFlags_Borders);
+        float w = propsW;
+        Splitter("##splitR", w, -1.0f, avail.y, s);
+        if (w != propsW) propsWUser = w;
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("##props", ImVec2(propsW, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding);
         DrawProperties();
         ImGui::EndChild();
     }
@@ -329,15 +398,28 @@ void App::Draw() {
 
     DrawInlineEditor();
 
+    // Notification: a small card at the bottom centre; long messages wrap.
     if (!toast.text.empty() && ImGui::GetTime() < toast.until) {
-        ImVec2 p = vp->WorkPos;
-        ImGui::SetNextWindowPos(ImVec2(p.x + 16 * dpiScale, p.y + vp->WorkSize.y - 16 * dpiScale), ImGuiCond_Always, ImVec2(0, 1));
-        ImGui::SetNextWindowBgAlpha(0.94f);
+        float maxW = std::min(vp->WorkSize.x * 0.6f, 720 * s);
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y - 24 * s),
+                                ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8 * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * s, 10 * s));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::Raised);
+        ImGui::PushStyleColor(ImGuiCol_Border, toast.error ? theme::Bad : theme::Line);
         ImGui::Begin("##toast", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        ImGui::TextColored(toast.error ? ImVec4(1, 0.5f, 0.5f, 1) : ImVec4(0.6f, 0.9f, 0.7f, 1), "%s", toast.text.c_str());
+        ImGui::TextColored(toast.error ? theme::Bad : theme::Good, "%s", toast.error ? ICON_INFO : ICON_CHECK);
+        ImGui::SameLine(0, 10 * s);
+        float textW = std::min(ImGui::CalcTextSize(toast.text.c_str()).x, maxW);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + textW + 1.0f);
+        ImGui::TextUnformatted(toast.text.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
     }
 
     // global shortcuts (never while typing in a text box)

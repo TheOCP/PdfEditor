@@ -7,6 +7,7 @@
 #include "pdf_ops.h"
 #include "gfx.h"
 #include "sysfonts.h"
+#include "i18n.h"
 #include <memory>
 
 enum class Tool { Select, Text, Image, Rect, Redact, Cut, Hand };
@@ -72,6 +73,9 @@ public:
     void ExportImagesDialog(float dpi);
     void ExtractTextDialog();
     void Toasts(const std::string& msg, bool error = false);
+    void ChangeLanguage(Lang l, bool save = true);   // applies right away, remembered
+    void DrawWelcome(ImVec2 origin, ImVec2 region);  // start screen (no document open)
+    void ChangeUiScale(float factor);           // 1.0 = Windows scaling
 
     // --- canvas (canvas.cpp) ---
     void DrawCanvas();
@@ -247,6 +251,7 @@ public:
     bool searchCase = false;
     bool searchWhole = false;
     std::vector<ops::SearchHit> searchHits;
+    std::string searchedFor;                // query the current results belong to
     int searchCurrent = -1;
     bool searchDirty = false;
     bool focusSearch = false;
@@ -259,6 +264,11 @@ public:
     bool showMeta = false;
     bool showAbout = false;
     bool showHelp = false;
+    bool showSettings = false;
+    bool uiScaleChanged = false;            // fonts must be rebuilt (window host)
+    bool uiShotOpenAll = false;             // --ui-shots: open collapsible sections
+    float thumbsWUser = 0, propsWUser = 0;  // panel widths set by dragging (0 = automatic)
+    ImFont* fontTitle = nullptr;            // large semibold font (start screen)
     bool showImport = false;
     std::wstring importFile;
     std::string importRange;
@@ -276,5 +286,6 @@ private:
     std::vector<FontChoice> fontList_;
     bool fontListBuilt_ = false;
     uint32_t fontListDoc_ = 0;
+    unsigned fontListLang_ = 0;
     bool fontDefaultPending = true;   // a new PDF was opened: default to its most used font
 };

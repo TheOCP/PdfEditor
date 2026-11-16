@@ -5,7 +5,7 @@
 #include <vector>
 
 struct FileFilter {
-    const wchar_t* label;   // "PDF documents"
+    std::wstring label;     // "PDF documents" (translated)
     const wchar_t* spec;    // "*.pdf"
 };
 

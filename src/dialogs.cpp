@@ -14,7 +14,7 @@ struct Com {
 
 bool RunDialog(HWND owner, IFileDialog* dlg, const std::vector<FileFilter>& filters, std::wstring& out) {
     std::vector<COMDLG_FILTERSPEC> specs;
-    for (auto& f : filters) specs.push_back({ f.label, f.spec });
+    for (auto& f : filters) specs.push_back({ f.label.c_str(), f.spec });
     if (!specs.empty()) dlg->SetFileTypes((UINT)specs.size(), specs.data());
     if (FAILED(dlg->Show(owner))) return false;
     Com<IShellItem> item;

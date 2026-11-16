@@ -45,6 +45,7 @@ add_executable(PdfEditor WIN32
     src/imageio.cpp
     src/sysfonts.cpp
     src/gfx.cpp
+    src/i18n.cpp
     src/selftest.cpp
     res/app.rc
     res/app.manifest

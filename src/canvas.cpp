@@ -2,7 +2,11 @@
 #include "dialogs.h"
 #include "imageio.h"
 #include "imgui.h"
+#include "i18n.h"
+#include "icons.h"
+#include "theme.h"
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 
 namespace {
@@ -195,7 +199,7 @@ void App::GroupSelection() {
     selGroupId = gid;
     int n = (int)groupSel.size();
     CommitIfDirty("Group objects");
-    Toasts(Fmt("Grouped %d objects - they now move as one", n));
+    Toasts(Fmt(T("Grouped %d objects"), n));
 }
 
 void App::UngroupSelection() {
@@ -206,21 +210,21 @@ void App::UngroupSelection() {
         selGroupId = 0;
         groupSel = { sel.obj };
         CommitIfDirty("Ungroup");
-        Toasts("Split into separate pieces");
+        Toasts(T("Split into separate pieces"));
         return;
     }
     if (!sel.parent && ops::ObjectType(sel.obj) == FPDF_PAGEOBJ_FORM) {
         ops::ExplodeForm(doc, pg, sel.obj);
         ClearSelection();
         CommitIfDirty("Ungroup");
-        Toasts("Broke the group into separate pieces");
+        Toasts(T("Split into separate pieces"));
     }
 }
 
 void App::SplitSelectedPath(bool pickNearest, float px, float py) {
     if (!sel.Valid(doc) || ops::ObjectType(sel.obj) != FPDF_PAGEOBJ_PATH) return;
     EnsureSelectionEditable();
-    if (ops::SplittableParts(sel.obj) < 2) { Toasts("This is already a single line"); return; }
+    if (ops::SplittableParts(sel.obj) < 2) { Toasts(T("This is already a single line")); return; }
     int pg = sel.page;
     auto parts = ops::SplitPath(doc, pg, sel.obj);
     if (parts.empty()) return;
@@ -236,7 +240,7 @@ void App::SplitSelectedPath(bool pickNearest, float px, float py) {
         SelectObjects(pg, parts, 0);
     }
     CommitIfDirty("Split into lines");
-    Toasts(Fmt("Split into %d separate lines - now move any of them", (int)parts.size()));
+    Toasts(Fmt(T("Split into %d separate lines"), (int)parts.size()));
 }
 
 // Selects leaves (optionally only lines) on `pg` matching `want`, promoting any
@@ -252,7 +256,7 @@ static void SelectLeaves(App& a, int pg, bool linesOnly, const PRect* within) {
     }
     if (pick.empty()) {
         a.ClearSelection();
-        if (!within) a.Toasts(linesOnly ? "No lines on this page" : "Nothing on this page", true);
+        if (!within) a.Toasts(T(linesOnly ? "No lines on this page" : "Nothing on this page"), true);
         return;
     }
     if (!nested.empty()) ops::PromoteAll(a.doc, pg, nested);   // same handles, now top-level
@@ -264,8 +268,7 @@ static void SelectLeaves(App& a, int pg, bool linesOnly, const PRect* within) {
     }
     a.SelectObjects(pg, pick, (same && common > 0) ? common : 0);
     a.InvalidatePage(pg);
-    a.Toasts(Fmt("Selected %d %s%s", (int)pick.size(), linesOnly ? "line(s)" : "object(s)",
-                 pick.size() > 1 ? " - right-click to group" : ""));
+    a.Toasts(Fmt(T(linesOnly ? "Selected %d line(s)" : "Selected %d object(s)"), (int)pick.size()));
 }
 
 void App::SelectAllOnPage(bool linesOnly) {
@@ -276,7 +279,7 @@ void App::SelectAllOnPage(bool linesOnly) {
 void App::GroupAllLines() {
     SelectAllOnPage(true);
     if (groupSel.size() >= 2 && !selGroupId) GroupSelection();
-    else if (selGroupId) Toasts("These lines are already a group");
+    else if (selGroupId) Toasts(T("These lines are already a group"));
 }
 
 // --------------------------------------------------------------- clipboard
@@ -296,7 +299,7 @@ void App::ClearLimbo() {
 
 void App::CopySelection() {
     if (AnnotSelected()) {
-        Toasts("Annotations can't be copied - right-click > Make this page's annotations editable", true);
+        Toasts(T("Annotations can't be copied - right-click > Make this page's annotations editable"), true);
         return;
     }
     if (!sel.Valid(doc)) return;
@@ -327,9 +330,9 @@ void App::CopySelection() {
         clipText.clear();
     }
     clipSeq = GetClipboardSequenceNumber();
-    if (clip.empty()) Toasts("Nothing in the selection can be copied", true);
-    else Toasts(Fmt("Copied %d object(s)%s - Ctrl+V pastes on the page under the mouse", (int)clip.size(),
-                    skipped ? " (some parts could not be copied)" : ""));
+    if (clip.empty()) Toasts(T("Nothing in the selection can be copied"), true);
+    else Toasts(Fmt(T(skipped ? "Copied %d object(s) (some parts could not be copied)" : "Copied %d object(s)"),
+                    (int)clip.size()));
 }
 
 void App::CutSelection() {
@@ -347,7 +350,7 @@ void App::CutSelection() {
     doc.ContentChanged(pg);
     ClearSelection();
     CommitIfDirty("Cut");
-    Toasts(Fmt("Cut %d object(s) - Ctrl+V pastes them on any page", (int)limbo.size()));
+    Toasts(Fmt(T("Cut %d object(s)"), (int)limbo.size()));
 }
 
 // Creates new text from plain text (e.g. copied in another program), in the
@@ -407,10 +410,11 @@ void App::PasteClipboard(bool atCursor) {
         if (hoverPage >= 0) { x = hoverPx; y = hoverPy; }
         else { FS_SIZEF sz = doc.PageSizePt(tp); x = 72; y = sz.height * 0.6f; }
         auto made = PasteTextAsObjects(*this, tp, x, y, sysText);
-        if (made.empty()) { Toasts("Nothing to paste", true); return; }
+        if (made.empty()) { Toasts(T("Nothing to paste"), true); return; }
         SelectObjects(tp, made, 0);
         CommitIfDirty("Paste text");
-        Toasts(Fmt("Pasted text (%d line%s) onto page %d", (int)made.size(), made.size() == 1 ? "" : "s", tp + 1));
+        Toasts(Fmt(T(made.size() == 1 ? "Pasted text (%d line) onto page %d" : "Pasted text (%d lines) onto page %d"),
+                   (int)made.size(), tp + 1));
         return;
     }
     if (clip.empty()) return;
@@ -449,12 +453,12 @@ void App::PasteClipboard(bool atCursor) {
         std::string err;
         for (auto& c : clip)
             if (FPDF_PAGEOBJECT o = ops::PasteObject(doc, tp, c, dx, dy, keepGid, err)) pasted.push_back(o);
-        if (pasted.empty()) { Toasts("Paste failed: " + err, true); return; }
+        if (pasted.empty()) { Toasts(std::string(T("Paste failed: ")) + T(err), true); return; }
     }
     SelectObjects(tp, pasted, keepGid);
     CommitIfDirty("Paste");
     ScrollToRect(tp, SelectionBounds());
-    Toasts(Fmt("Pasted %d object(s) onto page %d", (int)pasted.size(), tp + 1));
+    Toasts(Fmt(T("Pasted %d object(s) onto page %d"), (int)pasted.size(), tp + 1));
 }
 
 void App::PasteAt(int page, float px, float py) {
@@ -472,13 +476,13 @@ void App::TransferSelectionToPage(int tp, float dx, float dy) {
     std::vector<FPDF_PAGEOBJECT> moved;
     for (auto o : SelMembers(*this))
         if (ops::MoveObjectToPage(doc, src, o, tp, dx, dy)) moved.push_back(o);
-    if (moved.empty()) { Toasts("Could not move to that page", true); return; }
+    if (moved.empty()) { Toasts(T("Could not move to that page"), true); return; }
     SelectObjects(tp, moved, gid);
     InvalidatePage(src);
     InvalidatePage(tp);
     CommitIfDirty("Move to page");
     ScrollToRect(tp, SelectionBounds());
-    Toasts(Fmt("Moved %d object(s) to page %d", (int)moved.size(), tp + 1));
+    Toasts(Fmt(T("Moved %d object(s) to page %d"), (int)moved.size(), tp + 1));
 }
 
 // ------------------------------------------------------- picture pieces
@@ -493,19 +497,66 @@ void App::CutPieceFromImage(int page, PRect box) {
         if (a >= bestArea) { bestArea = a; best = &o; }
     }
     if (!best) {
-        Toasts("No picture under that box. Lines that aren't pictures can simply be clicked and moved.", true);
+        Toasts(T("There is no picture under that box."), true);
         return;
     }
     FPDF_PAGEOBJECT img = best->obj;
     if (best->parent) ops::PromoteObject(doc, page, img);
     std::string err;
     FPDF_PAGEOBJECT piece = ops::CutImageRegion(doc, page, img, box, err);
-    if (!piece) { Toasts("Could not cut: " + err, true); return; }
+    if (!piece) { Toasts(std::string(T("Could not cut: ")) + T(err), true); return; }
     SelectNewObject(page, piece);
     tool = Tool::Select;
     InvalidatePage(page);
     CommitIfDirty("Cut piece from picture");
-    Toasts("Piece lifted out of the picture - drag it anywhere, resize it, or delete it");
+    Toasts(T("Piece lifted out of the picture"));
+}
+
+// ------------------------------------------------------------- start screen
+
+void App::DrawWelcome(ImVec2 origin, ImVec2 region) {
+    float s = dpiScale;
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const char* title = T("PDF Editor");
+    const char* sub = T("by TheOCProductions & ShortGG");
+    std::string openL = std::string(ICON_OPEN "   ") + T("Open PDF");
+    std::string newL = std::string(ICON_NEW "   ") + T("New document");
+    const char* hint = T("or drop a PDF file here");
+    ImFont* big = fontTitle ? fontTitle : ImGui::GetFont();
+    ImVec2 titleSz = big->CalcTextSizeA(big->FontSize, FLT_MAX, 0.0f, title);
+    float bh = ImGui::GetFrameHeight() + 10 * s;
+    float bw = std::max(ImGui::CalcTextSize(openL.c_str()).x, ImGui::CalcTextSize(newL.c_str()).x) + st.FramePadding.x * 2 + 24 * s;
+    bool stack = bw * 2 + st.ItemSpacing.x + 64 * s > region.x;          // narrow: buttons under each other
+    float rowW = stack ? bw : bw * 2 + st.ItemSpacing.x;
+    float cardW = std::min(region.x - 24 * s, std::max(titleSz.x, rowW) + 72 * s);
+    float cardH = 40 * s + titleSz.y + ImGui::GetTextLineHeight() + 28 * s + (stack ? bh * 2 + st.ItemSpacing.y : bh) +
+                  18 * s + ImGui::GetTextLineHeight() + 36 * s;
+    ImVec2 c0(origin.x + (region.x - cardW) * 0.5f, origin.y + std::max(12 * s, (region.y - cardH) * 0.45f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(c0, ImVec2(c0.x + cardW, c0.y + cardH), ImGui::GetColorU32(theme::Panel), 14 * s);
+    dl->AddRect(c0, ImVec2(c0.x + cardW, c0.y + cardH), ImGui::GetColorU32(theme::Line), 14 * s);
+
+    float y = c0.y + 40 * s;
+    ImGui::PushFont(big);
+    ImGui::SetCursorScreenPos(ImVec2(c0.x + (cardW - titleSz.x) * 0.5f, y));
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    y += titleSz.y;
+    float subW = ImGui::CalcTextSize(sub).x;
+    ImGui::SetCursorScreenPos(ImVec2(c0.x + (cardW - subW) * 0.5f, y));
+    ImGui::TextDisabled("%s", sub);
+    y += ImGui::GetTextLineHeight() + 28 * s;
+
+    float bx = c0.x + (cardW - rowW) * 0.5f;
+    ImGui::SetCursorScreenPos(ImVec2(bx, y));
+    if (PrimaryButton(openL.c_str(), ImVec2(bw, bh))) OpenDialog();
+    if (stack) { y += bh + st.ItemSpacing.y; ImGui::SetCursorScreenPos(ImVec2(bx, y)); }
+    else ImGui::SameLine();
+    if (ImGui::Button(newL.c_str(), ImVec2(bw, bh))) NewDoc();
+    y += bh + 18 * s;
+    float hw = ImGui::CalcTextSize(hint).x;
+    ImGui::SetCursorScreenPos(ImVec2(c0.x + (cardW - hw) * 0.5f, y));
+    ImGui::TextDisabled("%s", hint);
 }
 
 // ------------------------------------------------------- inline text editing
@@ -556,12 +607,8 @@ static std::string FontNote(const ops::TextEditInfo& ti) {
         if (!chars.empty()) chars += " ";
         chars += "\"" + W2U(std::wstring(1, c)) + "\"";
     }
-    std::string font = ti.fontName.empty() ? "The PDF's font" : ti.fontName;
-    bool one = ti.missing.size() == 1;
-    return Fmt("%s in this PDF has no %s (a PDF only stores the characters it uses), so %s drawn in %s at the "
-               "same size and spot. Everything else stays %s.",
-               font.c_str(), chars.c_str(), one ? "just that character is" : "just those characters are",
-               ti.standIn.c_str(), font.c_str());
+    std::string font = ti.fontName.empty() ? std::string(T("The PDF's font")) : ti.fontName;
+    return Fmt(T("%s is not in the font %s - drawn with %s instead"), chars.c_str(), font.c_str(), ti.standIn.c_str());
 }
 
 void App::BeginNewText(int page, float px, float py) {
@@ -632,7 +679,7 @@ void App::CommitInlineEdit() {
             std::string note = FontNote(ti);
             if (!note.empty()) Toasts(note);
         } else {
-            Toasts("Could not add the text: " + err, true);
+            Toasts(std::string(T("Could not add the text: ")) + T(err), true);
         }
     } else if (editObj) {
         FPDF_PAGEOBJECT obj = editObj;
@@ -662,7 +709,7 @@ void App::CommitInlineEdit() {
             std::string note = FontNote(ti);
             if (!note.empty()) Toasts(note);
         } else {
-            Toasts("Could not change this text", true);
+            Toasts(T("Could not change this text"), true);
         }
     }
     editObj = nullptr;
@@ -746,14 +793,11 @@ void App::DrawCanvas() {
     if (region.x < 10 || region.y < 10) return;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(origin, ImVec2(origin.x + region.x, origin.y + region.y), IM_COL32(28, 28, 32, 255));
+    dl->AddRectFilled(origin, ImVec2(origin.x + region.x, origin.y + region.y), theme::CanvasBg);
 
     int n = doc.PageCount();
     if (n == 0) {
-        const char* msg = "Open a PDF  (Ctrl+O, or drop a file here)   or   create a new one  (Ctrl+N)";
-        ImVec2 ts = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2(origin.x + (region.x - ts.x) / 2, origin.y + region.y / 2 - ts.y), IM_COL32(150, 150, 160, 255), msg);
-        ImGui::InvisibleButton("##canvasHit", region);
+        DrawWelcome(origin, region);
         hoverPage = -1;
         return;
     }
@@ -933,7 +977,7 @@ void App::DrawCanvas() {
         ScreenBox(*this, ghostPage, ghostRect, p0, p1);
         dl->AddRectFilled(p0, p1, IM_COL32(60, 150, 255, 40));
         dl->AddRect(p0, p1, IM_COL32(60, 150, 255, 255), 0, 0, 2.0f);
-        dl->AddText(ImVec2(p0.x, p1.y + 2), IM_COL32(60, 150, 255, 255), Fmt("drop on page %d", ghostPage + 1).c_str());
+        dl->AddText(ImVec2(p0.x, p1.y + 2), IM_COL32(60, 150, 255, 255), Fmt(T("drop on page %d"), ghostPage + 1).c_str());
     }
     // --- rubber-band previews ---
     auto boxPreview = [&](int pg, PRect r, ImU32 fill, ImU32 line) {
@@ -1112,8 +1156,8 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
                 }
                 case Tool::Image: {
                     std::wstring f;
-                    if (OpenFileDialog(hwnd_, { { L"Images", L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp" },
-                                                { L"All files", L"*.*" } }, f)) {
+                    if (OpenFileDialog(hwnd_, { { TW("Images"), L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp" },
+                                                { TW("All files"), L"*.*" } }, f)) {
                         Image img; std::string err;
                         if (LoadImageFile(f, img, err)) {
                             FS_SIZEF sz = doc.PageSizePt(page);
@@ -1121,9 +1165,9 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
                             if (FPDF_PAGEOBJECT o = ops::AddImage(doc, page, img, px, py - w * img.h / img.w, w, err)) {
                                 SelectNewObject(page, o);
                                 CommitIfDirty("Add image");
-                                Toasts("Image added");
-                            } else Toasts("Add image failed: " + err, true);
-                        } else Toasts("Could not load image: " + err, true);
+                                Toasts(T("Image added"));
+                            } else Toasts(std::string(T("Add image failed: ")) + T(err), true);
+                        } else Toasts(std::string(T("Could not load image: ")) + T(err), true);
                     }
                     break;
                 }
@@ -1238,7 +1282,7 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
             ops::RedactResult r = ops::Redact(doc, dragPage, dragRect, 0, 0, 0);
             InvalidatePage(dragPage);
             CommitIfDirty("Redact");
-            Toasts(Fmt("Redacted: %d removed, %d text line(s) cut, %d picture(s) blacked out, %d annotation(s) removed",
+            Toasts(Fmt(T("Redacted: %d removed, %d text line(s) cut, %d picture(s) blacked out, %d annotation(s) removed"),
                        r.removed, r.textSplit, r.imagesMasked, r.annotsRemoved));
         } else if (dragMode == 7 && dragRect.Area() > 4) {
             CutPieceFromImage(dragPage, dragRect);
@@ -1262,7 +1306,7 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
             if (hit->type == FPDF_PAGEOBJ_PATH && ops::SplittableParts(hit->obj) > 1)
                 SplitSelectedPath(true, px, py);
             else if (ops::GetGroupId(sel.obj))
-                Toasts("Editing one piece - drag it or use the arrow keys; it stays in its group");
+                Toasts(T("Editing one piece of the group"));
         }
     }
 
@@ -1271,48 +1315,46 @@ void App::HandleCanvasInput(bool hovered, ImVec2 origin, ImVec2 region) {
     if (ImGui::BeginPopup("##objctx")) {
         bool any = false;
         if (AnnotSelected()) {
-            ImGui::TextDisabled("Annotation - drag it or use the arrow keys to move");
-            if (ImGui::MenuItem("Delete annotation", "Del")) DeleteSelection();
-            if (ImGui::MenuItem("Make this page's annotations editable")) FlattenCurrentPage();
+            ImGui::TextDisabled("%s", T("Annotation"));
+            if (ImGui::MenuItem(T("Delete annotation"), K("Del"))) DeleteSelection();
+            if (ImGui::MenuItem(T("Make this page's annotations editable"))) FlattenCurrentPage();
             any = true;
         } else if (sel.Valid(doc)) {
             bool grouped = selGroupId != 0, multi = groupSel.size() > 1;
             int t = ops::ObjectType(sel.obj);
             bool isForm = !sel.parent && t == FPDF_PAGEOBJ_FORM;
             int parts = (!multi && t == FPDF_PAGEOBJ_PATH) ? ops::SplittableParts(sel.obj) : 0;
-            if (!multi && t == FPDF_PAGEOBJ_TEXT && ImGui::MenuItem("Edit text", "Enter / double-click")) {
+            if (!multi && t == FPDF_PAGEOBJ_TEXT && ImGui::MenuItem(T("Edit text"), K("Enter / double-click"))) {
                 EnsureSelectionEditable();
                 BeginEditText(sel.page, sel.obj);
             }
-            if (multi && !grouped && ImGui::MenuItem(Fmt("Group these %d into one", (int)groupSel.size()).c_str())) GroupSelection();
+            if (multi && !grouped && ImGui::MenuItem(Fmt(T("Group these %d into one"), (int)groupSel.size()).c_str())) GroupSelection();
             if (grouped) {
-                ImGui::TextDisabled("Grouped - moves as one piece");
-                if (ImGui::MenuItem("Ungroup (back to separate pieces)")) UngroupSelection();
+                if (ImGui::MenuItem(T("Ungroup"))) UngroupSelection();
             }
-            if (isForm && ImGui::MenuItem("Break apart (ungroup)")) UngroupSelection();
-            if (parts > 1 && ImGui::MenuItem(Fmt("Split into %d separate lines", parts).c_str())) SplitSelectedPath(false, 0, 0);
-            if (!multi && t == FPDF_PAGEOBJ_IMAGE)
-                ImGui::TextDisabled("Tip: the Cut tool lifts a piece out of a picture");
+            if (isForm && ImGui::MenuItem(T("Break apart (ungroup)"))) UngroupSelection();
+            if (parts > 1 && ImGui::MenuItem(Fmt(T("Split into %d separate lines"), parts).c_str())) SplitSelectedPath(false, 0, 0);
+            if (!multi && t == FPDF_PAGEOBJ_IMAGE && ImGui::MenuItem(T("Cut piece tool"))) tool = Tool::Cut;
             ImGui::Separator();
-            if (ImGui::MenuItem("Copy", "Ctrl+C")) CopySelection();
-            if (ImGui::MenuItem("Cut", "Ctrl+X")) CutSelection();
-            if (doc.PageCount() > 1 && ImGui::BeginMenu("Move to page")) {
+            if (ImGui::MenuItem(T("Copy"), K("Ctrl+C"))) CopySelection();
+            if (ImGui::MenuItem(T("Cut"), K("Ctrl+X"))) CutSelection();
+            if (doc.PageCount() > 1 && ImGui::BeginMenu(T("Move to page"))) {
                 for (int i = 0; i < doc.PageCount(); ++i) {
                     if (i == sel.page) continue;
-                    if (ImGui::MenuItem(Fmt("Page %d", i + 1).c_str())) { TransferSelectionToPage(i); break; }
+                    if (ImGui::MenuItem(Fmt(T("Page %d"), i + 1).c_str())) { TransferSelectionToPage(i); break; }
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::MenuItem("Delete", "Del")) DeleteSelection();
+            if (ImGui::MenuItem(T("Delete"), K("Del"))) DeleteSelection();
             any = true;
         }
         if (any) ImGui::Separator();
         const char* cbt = ImGui::GetClipboardText();
         bool canPaste = !clip.empty() || !limbo.empty() || (cbt && *cbt);
-        if (ImGui::MenuItem("Paste here", "Ctrl+Shift+V", false, canPaste && ctxPage >= 0)) PasteAt(ctxPage, ctxPx, ctxPy);
-        if (ImGui::MenuItem("Select all on this page", "Ctrl+A")) SelectAllOnPage(false);
-        if (ImGui::MenuItem("Select all lines on this page", "Ctrl+Shift+A")) SelectAllOnPage(true);
-        if (ImGui::MenuItem("Group all lines on this page")) GroupAllLines();
+        if (ImGui::MenuItem(T("Paste here"), K("Ctrl+Shift+V"), false, canPaste && ctxPage >= 0)) PasteAt(ctxPage, ctxPx, ctxPy);
+        if (ImGui::MenuItem(T("Select all on this page"), K("Ctrl+A"))) SelectAllOnPage(false);
+        if (ImGui::MenuItem(T("Select all lines on this page"), K("Ctrl+Shift+A"))) SelectAllOnPage(true);
+        if (ImGui::MenuItem(T("Group all lines on this page"))) GroupAllLines();
         ImGui::EndPopup();
     }
 }

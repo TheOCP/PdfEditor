@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <cstdint>
+#include <vector>
 #include "imgui.h"
 
 bool GfxCreate(HWND hwnd);
@@ -16,6 +17,8 @@ bool GfxPresent();
 bool GfxOccluded();
 ID3D11Device* GfxDevice();
 ID3D11DeviceContext* GfxContext();
+// Copies the rendered back buffer (before Present) into BGRA pixels.
+bool GfxCaptureBackbuffer(std::vector<uint32_t>& bgra, int& w, int& h);
 
 class Texture {
 public:

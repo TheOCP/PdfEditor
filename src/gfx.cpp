@@ -65,6 +65,40 @@ void GfxBeginFrame(const float clear[4]) {
     g_ctx->ClearRenderTargetView(g_rtv, clear);
 }
 
+bool GfxCaptureBackbuffer(std::vector<uint32_t>& bgra, int& w, int& h) {
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) return false;
+    D3D11_TEXTURE2D_DESC d{};
+    back->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    bool ok = SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &staging));
+    if (ok) {
+        g_ctx->CopyResource(staging, back);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        ok = SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m));
+        if (ok) {
+            w = (int)d.Width;
+            h = (int)d.Height;
+            bgra.resize((size_t)w * h);
+            for (int y = 0; y < h; ++y) {
+                const uint8_t* row = static_cast<const uint8_t*>(m.pData) + (size_t)y * m.RowPitch;
+                for (int x = 0; x < w; ++x) {
+                    const uint8_t* p = row + x * 4;   // R G B A
+                    bgra[(size_t)y * w + x] = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+                }
+            }
+            g_ctx->Unmap(staging, 0);
+        }
+        staging->Release();
+    }
+    back->Release();
+    return ok;
+}
+
 bool GfxPresent() {
     HRESULT hr = g_swap->Present(1, 0);
     g_occluded = (hr == DXGI_STATUS_OCCLUDED);
