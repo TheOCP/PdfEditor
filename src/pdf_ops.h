@@ -79,6 +79,7 @@ struct TextEditInfo {
     bool otherCopy = false;                // another copy of the same font in this PDF had them all
     std::vector<FPDF_PAGEOBJECT> pieces;   // every object now showing the text, left to right
     int groupId = 0;                       // group tying the pieces together (0 = single object)
+    std::string trace;                     // which steps ran and why (diagnostics, no text content)
 };
 // Keeps the object's own font. Characters that font doesn't contain are taken
 // from another copy of the same font in the PDF if one has them; otherwise only

@@ -527,6 +527,27 @@ static void SelectEdited(App& a, int page, const ops::TextEditInfo& ti, FPDF_PAG
     else if (first) a.SelectNewObject(page, first);
 }
 
+// Appends how an edit was carried out (font name, steps, measurements - never
+// the text) to edit-trace.log next to the program, for diagnosing odd PDFs.
+static void LogEditTrace(const ops::TextEditInfo& ti) {
+    if (ti.trace.empty()) return;
+    wchar_t exe[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+    std::wstring path(exe);
+    size_t slash = path.find_last_of(L"/\\");
+    path = (slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1)) + L"edit-trace.log";
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::string line = Fmt("%04d-%02d-%02d %02d:%02d:%02d  pieces %d, missing %d, stand-in '%s': %s",
+                           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (int)ti.pieces.size(),
+                           (int)ti.missing.size(), ti.standIn.c_str(), ti.trace.c_str());
+    if (FILE* f = _wfopen(path.c_str(), L"ab")) {
+        fwrite(line.data(), 1, line.size(), f);
+        fwrite("\r\n", 1, 2, f);
+        fclose(f);
+    }
+}
+
 // Plain words for what happened when the PDF's font lacked a typed character.
 static std::string FontNote(const ops::TextEditInfo& ti) {
     if (ti.standIn.empty() || ti.missing.empty()) return {};
@@ -632,7 +653,9 @@ void App::CommitInlineEdit() {
         FPDF_PAGEOBJECT repl = nullptr;
         bool fallback = false;
         ops::TextEditInfo ti;
-        if (ops::SetObjectTextSafe(doc, editPage, obj, w, &repl, &fallback, &ti)) {
+        bool okEdit = ops::SetObjectTextSafe(doc, editPage, obj, w, &repl, &fallback, &ti);
+        LogEditTrace(ti);
+        if (okEdit) {
             SelectEdited(*this, editPage, ti, repl);
             InvalidatePage(editPage);
             CommitIfDirty("Edit text");

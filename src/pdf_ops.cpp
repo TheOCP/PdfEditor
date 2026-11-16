@@ -1,3 +1,4 @@
+#include <cstdarg>
 #include "pdf_ops.h"
 #include <algorithm>
 #include <cmath>
@@ -462,8 +463,28 @@ struct Glyph {
     unsigned u = 0;
     float x = 0;      // page x of its origin
     float w = 0;      // its own advance (font width only, no extra spacing)
+    float bw = 0, bh = 0;   // its ink box (page units)
+    int64_t code = -1;      // the exact char code it uses, when identified
     bool gen = false; // a word gap the text layer inferred (no glyph in the PDF)
 };
+
+static unsigned NormSpace(unsigned u) {
+    return (u == 0xA0 || (u >= 0x2000 && u <= 0x200A) || u == 0x202F || u == 0x3000) ? ' ' : u;
+}
+
+// Diagnostics for the current text edit (set by SetObjectTextSafe): which
+// branch ran and why. Never contains the text itself.
+static std::string* g_trace = nullptr;
+static void Trace(const char* fmt, ...) {
+    if (!g_trace) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (!g_trace->empty()) *g_trace += "; ";
+    *g_trace += buf;
+}
 
 static std::vector<Glyph> GlyphsOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
     std::vector<Glyph> cs, out;
@@ -476,12 +497,18 @@ static std::vector<Glyph> GlyphsOf(Document& d, int page, FPDF_PAGEOBJECT obj) {
         g.u = FPDFText_GetUnicode(tp, i);
         // Fonts often share one glyph between space and no-break space, so a typed
         // space can read back as U+00A0 (or another Unicode space): it's a space.
-        if (g.u == 0xA0 || (g.u >= 0x2000 && g.u <= 0x200A) || g.u == 0x202F || g.u == 0x3000) g.u = ' ';
+        g.u = NormSpace(g.u);
         g.gen = FPDFText_IsGenerated(tp, i) == 1;
         double ox = 0, oy = 0;
         if (FPDFText_GetCharOrigin(tp, i, &ox, &oy)) g.x = (float)ox;
         FS_RECTF r;
         if (!g.gen && FPDFText_GetLooseCharBox(tp, i, &r)) g.w = std::fabs(r.right - r.left);
+        if (!g.gen) {
+            double l = 0, rr = 0, b = 0, t = 0;
+            FPDFText_GetCharBox(tp, i, &l, &rr, &b, &t);
+            g.bw = (float)(rr - l);
+            g.bh = (float)(t - b);
+        }
         cs.push_back(g);
     }
     int lastReal = -1, real = 0, genGaps = 0;
@@ -656,6 +683,18 @@ static bool CharsRoundTrip(Document& d, int page, FPDF_PAGEOBJECT o, const std::
     return ok;
 }
 
+// The page an object is on (`prefer` first), or -1.
+static int PageOfObject(Document& d, FPDF_PAGEOBJECT obj, int prefer) {
+    if (!obj) return -1;
+    int n = d.PageCount();
+    if (prefer >= 0 && prefer < n)
+        for (auto& o : ListObjects(d, prefer)) if (o.obj == obj) return prefer;
+    for (int pg = 0; pg < n; ++pg)
+        if (pg != prefer)
+            for (auto& o : ListObjects(d, pg)) if (o.obj == obj) return pg;
+    return -1;
+}
+
 // Text of an object wherever it is (it may sit on another page than `prefer`).
 static std::wstring TextAnywhere(Document& d, FPDF_PAGEOBJECT obj, int prefer) {
     if (!obj) return {};
@@ -753,6 +792,20 @@ static FPDF_PAGEOBJECT NewTextObj(Document& d, FPDF_FONT f, const TextLook& lk, 
     FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(d.Raw(), f, lk.tf);
     if (!o) return nullptr;
     if (!FPDFText_SetText(o, WS(s))) { FPDFPageObj_Destroy(o); return nullptr; }
+    FPDFPageObj_SetMatrix(o, &m);
+    FPDFPageObj_SetFillColor(o, lk.fr, lk.fg, lk.fb, lk.fa);
+    FPDFPageObj_SetStrokeColor(o, lk.sr, lk.sg, lk.sb, lk.sa);
+    if (lk.render >= 0) FPDFTextObj_SetTextRenderMode(o, (FPDF_TEXT_RENDERMODE)lk.render);
+    return o;
+}
+
+// Same as NewTextObj, but with exact char codes instead of typed text.
+static FPDF_PAGEOBJECT NewTextObjCodes(Document& d, FPDF_FONT f, const TextLook& lk, const FS_MATRIX& m,
+                                       const std::vector<uint32_t>& codes) {
+    if (!f || codes.empty()) return nullptr;
+    FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(d.Raw(), f, lk.tf);
+    if (!o) return nullptr;
+    if (!FPDFText_SetCharcodes(o, codes.data(), codes.size())) { FPDFPageObj_Destroy(o); return nullptr; }
     FPDFPageObj_SetMatrix(o, &m);
     FPDFPageObj_SetFillColor(o, lk.fr, lk.fg, lk.fb, lk.fa);
     FPDFPageObj_SetStrokeColor(o, lk.sr, lk.sg, lk.sb, lk.sa);
@@ -865,6 +918,253 @@ static void TagPieces(Document& d, int page, const std::vector<FPDF_PAGEOBJECT>&
     d.ContentChanged(page);
 }
 
+// ------------------------------------------------ exact glyphs (char codes)
+//
+// Some fonts hold several glyphs for the same character - e.g. a statement
+// font with a thin, a bold and a wide (tabular) version of every digit, and a
+// dot that is 2.53 or 6.00 wide. Re-typing text lets PDFium pick *a* code for
+// each character, usually not the one the PDF used, so every edited text
+// changed width, weight and spacing. Instead the font's codes are mapped once,
+// each original character's exact code is identified by its precise metrics,
+// and edits are written with those codes (FPDFText_SetCharcodes).
+
+struct CodeGlyph {
+    uint32_t code = 0;
+    unsigned u = 0;
+    float adv = 0, bw = 0, bh = 0;   // per 1 pt of font size, unit matrix
+};
+struct CodeMap {
+    std::vector<CodeGlyph> all;
+    std::map<uint32_t, size_t> at;                 // code -> index in all
+    std::map<unsigned, std::vector<size_t>> byU;   // drawable glyphs (and spaces) per character
+    bool variants = false;                         // some character has several glyphs
+    const CodeGlyph* Get(int64_t code) const {
+        auto it = at.find((uint32_t)code);
+        return it == at.end() ? nullptr : &all[it->second];
+    }
+    // Does any visible character of these have more than one glyph?
+    bool Ambiguous(const std::wstring& text, const std::vector<Glyph>& O) const {
+        auto many = [&](unsigned u) {
+            if (u == ' ') return false;
+            auto it = byU.find(u);
+            return it != byU.end() && it->second.size() > 1;
+        };
+        for (wchar_t c : text) if (many(NormSpace(c))) return true;
+        for (const Glyph& g : O) if (many(g.u)) return true;
+        return false;
+    }
+};
+
+static FPDF_PAGEOBJECT TextObjFromCodes(Document& d, FPDF_FONT f, float tf, const std::vector<uint32_t>& codes) {
+    FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(d.Raw(), f, tf);
+    if (!o) return nullptr;
+    if (!codes.empty() && !FPDFText_SetCharcodes(o, codes.data(), codes.size())) {
+        FPDFPageObj_Destroy(o);
+        return nullptr;
+    }
+    return o;
+}
+
+// Reads the glyph of every code in [from, from + count) through the text layer.
+static void ReadCodeChunk(Document& d, int page, FPDF_FONT f, uint32_t from, uint32_t count,
+                          std::map<uint32_t, CodeGlyph>& out) {
+    const float kTf = 10;
+    FPDF_PAGE p = d.Page(page);
+    if (!p) return;
+    auto readChar = [&](FPDF_TEXTPAGE tp, int i, CodeGlyph& g) {
+        g.u = NormSpace(FPDFText_GetUnicode(tp, i));
+        FS_RECTF r{};
+        if (FPDFText_GetLooseCharBox(tp, i, &r)) g.adv = std::fabs(r.right - r.left) / kTf;
+        double l = 0, rr = 0, b = 0, t = 0;
+        FPDFText_GetCharBox(tp, i, &l, &rr, &b, &t);
+        g.bw = (float)(rr - l) / kTf;
+        g.bh = (float)(t - b) / kTf;
+    };
+    // One object per code (never one object for all: the text layer may drop or
+    // split characters, and matching by order would then pair codes with the
+    // wrong characters). Placed far off the page first so nothing on the page
+    // can merge with them; on the page if the text layer ignores that area.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        float ox = attempt == 0 ? -20000.0f : 0.0f, oy = attempt == 0 ? -20000.0f : 0.0f;
+        std::map<FPDF_PAGEOBJECT, uint32_t> codeOf;
+        for (uint32_t k = 0; k < count; ++k) {
+            FPDF_PAGEOBJECT o = TextObjFromCodes(d, f, kTf, { from + k });
+            if (!o) continue;
+            FPDFPageObj_Transform(o, 1, 0, 0, 1, ox + (float)(k % 32) * 16.0f, oy + (float)(k / 32) * 16.0f);
+            FPDFPage_InsertObject(p, o);
+            codeOf[o] = from + k;
+        }
+        d.ContentChanged(page);
+        std::map<FPDF_PAGEOBJECT, int> count1, firstIdx;
+        FPDF_TEXTPAGE tp = d.TextPage(page);
+        if (tp)
+            for (int i = 0, n = FPDFText_CountChars(tp); i < n; ++i) {
+                FPDF_PAGEOBJECT o = FPDFText_GetTextObject(tp, i);
+                if (!codeOf.count(o) || FPDFText_IsGenerated(tp, i) == 1) continue;
+                if (count1[o]++ == 0) firstIdx[o] = i;
+            }
+        size_t found = 0;
+        for (auto& [o, c] : count1) {
+            if (c != 1) continue;                  // exactly one character per code, or it's not usable
+            CodeGlyph g;
+            g.code = codeOf[o];
+            readChar(tp, firstIdx[o], g);
+            out[g.code] = g;
+            ++found;
+        }
+        for (auto& [o, c] : codeOf)
+            if (FPDFPage_RemoveObject(p, o)) FPDFPageObj_Destroy(o);
+        d.ContentChanged(page);
+        if (found > 0) return;
+    }
+}
+
+static const CodeMap& CodeMapFor(Document& d, int page, FPDF_FONT f) {
+    static std::map<std::pair<uint32_t, FPDF_FONT>, CodeMap> cache;   // per loaded document + font
+    auto key = std::make_pair(d.DocId(), f);
+    auto hit = cache.find(key);
+    if (hit != cache.end()) return hit->second;
+    CodeMap cm;
+    std::map<uint32_t, CodeGlyph> got;
+    ReadCodeChunk(d, page, f, 0, 512, got);
+    // Simple (one-byte) fonts repeat every 256 codes.
+    int pairs = 0, same = 0;
+    for (uint32_t k = 0; k < 256; ++k) {
+        auto a = got.find(k), b = got.find(k + 256);
+        if (a == got.end() || b == got.end()) continue;
+        ++pairs;
+        if (a->second.u == b->second.u && std::fabs(a->second.adv - b->second.adv) < 1e-4f &&
+            std::fabs(a->second.bw - b->second.bw) < 1e-4f && std::fabs(a->second.bh - b->second.bh) < 1e-4f)
+            ++same;
+    }
+    bool oneByte = pairs >= 16 && same == pairs;
+    if (oneByte) {
+        got.erase(got.lower_bound(256), got.end());
+    } else {
+        for (uint32_t from = 512; from < 65536; from += 1024) {
+            std::map<uint32_t, CodeGlyph> chunk;
+            ReadCodeChunk(d, page, f, from, 1024, chunk);
+            bool any = false;
+            for (auto& [c, g] : chunk) any = any || g.bw > 1e-4f || g.bh > 1e-4f;
+            got.insert(chunk.begin(), chunk.end());
+            if (!any) break;                           // past the last glyph
+        }
+    }
+    std::vector<CodeGlyph> all;
+    for (auto& [c, g] : got) all.push_back(g);
+    for (size_t k = 0; k < all.size(); ++k) {
+        const CodeGlyph& g = all[k];
+        cm.at[g.code] = k;
+        if (g.u == 0) continue;
+        bool drawn = g.bw > 1e-4f || g.bh > 1e-4f;
+        if (drawn || g.u == ' ') cm.byU[g.u].push_back(k);
+    }
+    for (auto& [u, v] : cm.byU)
+        if (u != ' ' && v.size() > 1) { cm.variants = true; break; }
+    cm.all = std::move(all);
+    return cache[key] = std::move(cm);
+}
+
+// Which exact glyph each original character uses, from its precise advance
+// and ink box (sx, sy: page units per 1 pt of font size).
+static void IdentifyCodes(const CodeMap& cm, std::vector<Glyph>& O, float sx, float sy) {
+    for (Glyph& g : O) {
+        g.code = -1;
+        if (g.gen || g.u == ' ') continue;
+        auto it = cm.byU.find(g.u);
+        if (it == cm.byU.end()) continue;
+        float best = 1e9f;
+        int64_t bc = -1;
+        for (size_t k : it->second) {
+            const CodeGlyph& c = cm.all[k];
+            float dd = std::fabs(c.adv * sx - g.w) + std::fabs(c.bw * sx - g.bw) + std::fabs(c.bh * sy - g.bh);
+            if (dd < best) { best = dd; bc = c.code; }
+        }
+        if (best < 0.01f * std::fabs(sx)) g.code = bc;
+    }
+}
+
+static int CharClass(unsigned u) {
+    if (u < 0x10000 && iswdigit((wchar_t)u)) return 0;
+    if (u < 0x10000 && iswupper((wchar_t)u)) return 1;
+    if (u < 0x10000 && iswlower((wchar_t)u)) return 2;
+    return 3;
+}
+
+// Which original character each typed one stands in for (same length: by
+// position; otherwise the common start and end).
+static std::vector<int> MatchIndices(const std::wstring& text, const std::vector<Glyph>& O) {
+    int n = (int)text.size(), mo = (int)O.size();
+    std::vector<int> match(n, -1);
+    if (n == mo) {
+        for (int j = 0; j < n; ++j) match[j] = j;
+        return match;
+    }
+    int L = 0, S = 0;
+    while (L < n && L < mo && NormSpace(text[L]) == O[L].u) ++L;
+    while (S < n - L && S < mo - L && NormSpace(text[n - 1 - S]) == O[mo - 1 - S].u) ++S;
+    for (int j = 0; j < L; ++j) match[j] = j;
+    for (int k = 0; k < S; ++k) match[n - 1 - k] = mo - 1 - k;
+    return match;
+}
+
+// The code to write for each typed character (-1 = the font has no glyph for
+// it, or a space with no glyph - spaces are then just room). Unchanged
+// characters keep their exact glyph, characters used elsewhere in the
+// original reuse that glyph, new ones get the variant that matches the
+// original's style (same width and height class, nearest code range).
+static std::vector<int64_t> ChooseCodes(const CodeMap& cm, const std::vector<Glyph>& O, const std::vector<int>& match,
+                                        const std::wstring& text, float sx, float sy) {
+    std::map<unsigned, int64_t> used;
+    std::vector<int64_t> origCodes;
+    std::vector<float> clsAdv[4], clsH[4];
+    float spaceAdv = -1;
+    for (const Glyph& g : O) {
+        if (!g.gen && g.u == ' ' && spaceAdv < 0) spaceAdv = g.w / sx;
+        if (g.code < 0) continue;
+        if (!used.count(g.u)) used[g.u] = g.code;
+        origCodes.push_back(g.code);
+        int k = CharClass(g.u);
+        clsAdv[k].push_back(g.w / sx);
+        clsH[k].push_back(g.bh / sy);
+    }
+    auto median = [](std::vector<float> v) {
+        if (v.empty()) return -1.0f;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    float refA[4], refH[4];
+    for (int k = 0; k < 4; ++k) { refA[k] = median(clsAdv[k]); refH[k] = median(clsH[k]); }
+    std::vector<int64_t> out(text.size(), -1);
+    for (size_t j = 0; j < text.size(); ++j) {
+        unsigned u = NormSpace(text[j]);
+        int i = match[j];
+        if (i >= 0 && O[i].u == u && O[i].code >= 0) { out[j] = O[i].code; continue; }
+        auto u2 = used.find(u);
+        if (u2 != used.end()) { out[j] = u2->second; continue; }
+        auto it = cm.byU.find(u);
+        if (it == cm.byU.end()) continue;
+        float best = 1e9f;
+        for (size_t idx : it->second) {
+            const CodeGlyph& c = cm.all[idx];
+            float score;
+            if (u == ' ') {
+                score = std::fabs(c.adv - (spaceAdv > 0 ? spaceAdv : 0.27f));
+            } else {
+                int k = CharClass(u);
+                score = 0;
+                if (refA[k] > 0) score += std::fabs(c.adv - refA[k]) / refA[k] * 4.0f;
+                if (refH[k] > 0) score += std::fabs(c.bh - refH[k]) / refH[k];
+                int64_t dist = origCodes.empty() ? 0 : INT64_MAX;
+                for (int64_t oc : origCodes) dist = std::min<int64_t>(dist, std::llabs(oc - (int64_t)c.code));
+                score += (float)dist / 500.0f;
+            }
+            if (score < best) { best = score; out[j] = c.code; }
+        }
+    }
+    return out;
+}
+
 // Many PDFs store a separate copy ("subset") of the same font per page, each
 // with only the letters that page uses. Try the other copies for the letters
 // this one lacks. Returns the new object (inserted after `after`) or null.
@@ -899,14 +1199,18 @@ static FPDF_PAGEOBJECT TryOtherCopies(Document& d, int page, FPDF_PAGEOBJECT aft
 // tagged as one text and grouped so they move and edit together.
 static std::vector<FPDF_PAGEOBJECT> PlacePieces(Document& d, int page, FPDF_PAGEOBJECT reuse, FPDF_FONT font,
                                                 FPDF_FONT alt, float kx, float ky, const TextLook& lk,
-                                                const std::wstring& text, const std::wstring& missing, int groupId) {
-    struct Run { std::wstring s; bool alt; };
+                                                const std::wstring& text, const std::wstring& missing, int groupId,
+                                                const std::vector<int64_t>* codes = nullptr) {
+    struct Run { std::wstring s; bool alt; std::vector<uint32_t> cc; };
     std::vector<Run> runs;
-    for (wchar_t c : text) {
+    for (size_t j = 0; j < text.size(); ++j) {
+        wchar_t c = text[j];
         bool a = iswspace(c) ? (!runs.empty() && runs.back().alt) : missing.find(c) != std::wstring::npos;
-        if (runs.empty() || runs.back().alt != a) runs.push_back({ {}, a });
+        if (runs.empty() || runs.back().alt != a) runs.push_back({ {}, a, {} });
         runs.back().s += c;
+        if (codes && j < codes->size() && (*codes)[j] >= 0) runs.back().cc.push_back((uint32_t)(*codes)[j]);
     }
+    bool byCode = codes != nullptr;
     std::vector<FPDF_PAGEOBJECT> out;
     FPDF_PAGE p = d.Page(page);
     if (!p) return out;
@@ -919,14 +1223,15 @@ static std::vector<FPDF_PAGEOBJECT> PlacePieces(Document& d, int page, FPDF_PAGE
         if (!r.alt && reuse) {
             o = reuse;
             reuse = nullptr;
-            FPDFText_SetText(o, WS(r.s));
+            if (byCode) FPDFText_SetCharcodes(o, r.cc.data(), r.cc.size());
+            else FPDFText_SetText(o, WS(r.s));
             FS_MATRIX cur = ObjMatrix(o);
             Xform(o, 1, 0, 0, 1, x - cur.e, lk.m.f - cur.f);   // moves its clip along
         } else {
             FS_MATRIX mm = r.alt ? MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, lk.m) : lk.m;
             mm.e = x;
             mm.f = lk.m.f;
-            o = NewTextObj(d, r.alt ? alt : font, lk, mm, r.s);
+            o = (byCode && !r.alt) ? NewTextObjCodes(d, font, lk, mm, r.cc) : NewTextObj(d, r.alt ? alt : font, lk, mm, r.s);
             if (!o) continue;
             int idx = anchor ? TopIndex(p, anchor) : -1;
             InsertAt(p, o, idx >= 0 ? idx + 1 : -1);
@@ -978,14 +1283,19 @@ static std::vector<float> MeasureAdvances(Document& d, int page, FPDF_FONT f, co
 static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PAGEOBJECT cur, FPDF_FONT font,
                                                   const std::vector<Glyph>& O, const std::wstring& text,
                                                   const std::wstring& missing, FPDF_FONT alt, float kx, float ky,
-                                                  const TextLook& lk, int groupId, bool& handled) {
+                                                  const TextLook& lk, int groupId, bool& handled,
+                                                  const std::vector<int64_t>* codes = nullptr, const CodeMap* cm = nullptr) {
     handled = false;
+    bool byCode = codes && cm && codes->size() == text.size();
     std::vector<FPDF_PAGEOBJECT> out;
     FPDF_PAGE p = d.Page(page);
     int n = (int)text.size(), mo = (int)O.size();
-    if (!p || !cur || n == 0 || mo == 0 || !Upright(lk.m)) return out;
-    for (wchar_t c : text) if (c >= 0xD800 && c <= 0xDFFF) return out;
-    for (const Glyph& g : O) if (g.u > 0xFFFF) return out;
+    if (!p || !cur || n == 0 || mo == 0 || !Upright(lk.m)) {
+        Trace("fit: skipped (chars %d, original glyphs %d, matrix %.4f %.4f %.4f %.4f)", n, mo, lk.m.a, lk.m.b, lk.m.c, lk.m.d);
+        return out;
+    }
+    for (wchar_t c : text) if (c >= 0xD800 && c <= 0xDFFF) { Trace("fit: skipped (surrogates)"); return out; }
+    for (const Glyph& g : O) if (g.u > 0xFFFF) { Trace("fit: skipped (wide chars)"); return out; }
     float em = lk.tf * lk.m.a;                              // one em in page units
     float tol = std::max(0.04f, 0.004f * em);              // exact: about a third of a pixel at 100%
     auto isMissing = [&](wchar_t c) { return !iswspace(c) && missing.find(c) != std::wstring::npos; };
@@ -1022,14 +1332,32 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
         (isMissing(text[j]) ? altS : ownS) += text[j];
     }
     FS_MATRIX am = MatMul(FS_MATRIX{ kx, 0, 0, ky, 0, 0 }, lk.m);
-    std::vector<float> ownW = MeasureAdvances(d, page, font, lk, lk.m, ownS);
+    std::vector<float> ownW;
+    if (byCode) {                                          // exact glyphs: their widths are known
+        for (int j = 0; j < n; ++j) {
+            if (iswspace(text[j]) || same(j) || isMissing(text[j])) continue;
+            const CodeGlyph* g = (*codes)[j] >= 0 ? cm->Get((*codes)[j]) : nullptr;
+            if (!g) { ownW.clear(); break; }
+            ownW.push_back(g->adv * em);
+        }
+    } else {
+        ownW = MeasureAdvances(d, page, font, lk, lk.m, ownS);
+    }
     std::vector<float> altW = altS.empty() ? std::vector<float>{} : MeasureAdvances(d, page, alt, lk, am, altS);
-    if (ownW.size() != ownS.size() || altW.size() != altS.size()) return out;
+    if (ownW.size() != ownS.size() || altW.size() != altS.size()) {
+        Trace("fit: could not measure (own %zu/%zu, stand-in %zu/%zu)", ownW.size(), ownS.size(), altW.size(), altS.size());
+        return out;
+    }
 
     // Width of a newly typed space: the font's own, measured between two glyphs it has.
     float spaceW = 0.28f * em;
     for (int j = 0; j < n; ++j) {
         if (!iswspace(text[j]) || (match[j] >= 0 && O[match[j]].u == ' ')) continue;
+        if (byCode) {
+            if (const CodeGlyph* sg = (*codes)[j] >= 0 ? cm->Get((*codes)[j]) : nullptr)
+                if (sg->adv * em > 0.05f * em) spaceW = sg->adv * em;
+            break;
+        }
         wchar_t g = 0;
         for (wchar_t c : text) if (!iswspace(c) && !isMissing(c)) { g = c; break; }
         if (g) {
@@ -1066,14 +1394,18 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
         for (const Glyph& g : GlyphsOf(d, page, cur)) if (!g.gen && g.u != ' ') px.push_back(g.x);
         std::vector<float> want;
         for (int j = 0; j < n; ++j) if (!iswspace(text[j])) want.push_back(x[j]);
-        if (px.size() != want.size()) return out;         // can't compare: leave it alone
+        if (px.size() != want.size()) {                   // can't compare: leave it alone
+            Trace("fit: can't compare (now %zu glyphs, typed %zu)", px.size(), want.size());
+            return out;
+        }
         float dev = 0;
         for (size_t k = 0; k < px.size(); ++k) dev = std::max(dev, std::fabs(px[k] - want[k]));
+        Trace("fit: natural layout off by %.3f pt (tolerance %.3f)", dev, tol);
         if (dev <= tol) { handled = true; return { cur }; }
     }
 
     // Pieces: a new piece wherever natural spacing can't reach the right spot.
-    struct Run { std::wstring s; bool alt; float x; float slotX, slotW; };
+    struct Run { std::wstring s; bool alt; float x; float slotX, slotW; std::vector<uint32_t> cc; };
     std::vector<Run> runs;
     float runEnd = 0;
     bool open = false;
@@ -1085,10 +1417,11 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
             runs.back().s += c;
             runEnd += adv[j];
         } else {
-            runs.push_back({ std::wstring(1, c), a, x[j] + (a ? off[j] : 0.0f), a ? x[j] : NAN, a ? adv[j] : 0.0f });
+            runs.push_back({ std::wstring(1, c), a, x[j] + (a ? off[j] : 0.0f), a ? x[j] : NAN, a ? adv[j] : 0.0f, {} });
             runEnd = x[j] + adv[j];
             open = true;
         }
+        if (byCode && !a && (*codes)[j] >= 0) runs.back().cc.push_back((uint32_t)(*codes)[j]);
     }
     std::vector<std::pair<float, float>> slots;
     for (const Run& r : runs) slots.push_back({ r.slotX, r.slotW });
@@ -1098,7 +1431,8 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
         FS_MATRIX mm = r.alt ? am : lk.m;
         mm.e = r.x;
         mm.f = lk.m.f;
-        FPDF_PAGEOBJECT o = NewTextObj(d, r.alt ? alt : font, lk, mm, r.s);
+        FPDF_PAGEOBJECT o = (byCode && !r.alt) ? NewTextObjCodes(d, font, lk, mm, r.cc)
+                                               : NewTextObj(d, r.alt ? alt : font, lk, mm, r.s);
         if (!o) {
             for (FPDF_PAGEOBJECT q : out) if (FPDFPage_RemoveObject(p, q)) FPDFPageObj_Destroy(q);
             d.ContentChanged(page);
@@ -1113,6 +1447,7 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
     if (out.empty()) return out;
     if (FPDFPage_RemoveObject(p, cur)) FPDFPageObj_Destroy(cur);
     TagPieces(d, page, out, isAlt, groupId, &slots);
+    Trace("fit: placed %zu pieces at the original positions", out.size());
     handled = true;
     return out;
 }
@@ -1179,6 +1514,8 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
     TextEditInfo local;
     TextEditInfo& ti = info ? *info : local;
     ti = TextEditInfo{};
+    g_trace = &ti.trace;
+    struct TraceOff { ~TraceOff() { g_trace = nullptr; } } traceOff;
     if (replaced) *replaced = obj;
     if (usedFallback) *usedFallback = false;
     if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT || text.empty()) return false;
@@ -1232,7 +1569,54 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
     } else {
         O.clear();
     }
+    Trace("font %s, %zu original glyphs, readable %d, pieces before %zu, matrix %.4f %.4f %.4f %.4f",
+          ti.fontName.c_str(), O.size(), (int)verifiable, pieces.size(), lk.m.a, lk.m.b, lk.m.c, lk.m.d);
     bool laid = false;
+
+    // 0. Fonts with several glyphs per character (thin / bold / wide versions
+    //    of every digit, ...): write the exact glyphs the PDF used instead of
+    //    letting the font pick a different version of each character.
+    if (!O.empty() && refFont) {
+        const CodeMap& cm = CodeMapFor(d, page, refFont);
+        if (cm.variants && cm.Ambiguous(text, O)) {
+            float sx = lk.tf * lk.m.a, sy = lk.tf * lk.m.d;
+            IdentifyCodes(cm, O, sx, sy);
+            int identified = 0;
+            for (const Glyph& g : O) if (g.code >= 0) ++identified;
+            std::vector<int64_t> codes = ChooseCodes(cm, O, MatchIndices(text, O), text, sx, sy);
+            for (size_t j = 0; j < text.size(); ++j)
+                if (!iswspace(text[j]) && codes[j] < 0 && ti.missing.find(text[j]) == std::wstring::npos) ti.missing += text[j];
+            Trace("exact glyphs: font has several glyphs per character, %d of %zu original glyphs identified, %zu missing",
+                  identified, O.size(), ti.missing.size());
+            if (ti.missing.empty()) {
+                std::vector<uint32_t> cc;
+                for (int64_t c : codes) if (c >= 0) cc.push_back((uint32_t)c);
+                FPDFText_SetCharcodes(obj, cc.data(), cc.size());
+                d.ContentChanged(page);
+                std::wstring bad;
+                if (CharsRoundTrip(d, page, obj, text, &bad, own)) {
+                    auto fit = FitToOriginal(d, page, obj, refFont, O, text, L"", nullptr, 1, 1, lk, gid, laid, &codes, &cm);
+                    return done(laid ? fit : std::vector<FPDF_PAGEOBJECT>{ obj });
+                }
+                // A chosen glyph reads back wrong or draws nothing: stand-in for those.
+                Trace("exact glyphs: %zu characters failed the check", bad.size());
+                if (bad.empty())
+                    for (wchar_t c : text) if (!iswspace(c) && bad.find(c) == std::wstring::npos) bad += c;
+                ti.missing = bad;
+                for (size_t j = 0; j < text.size(); ++j)
+                    if (bad.find(text[j]) != std::wstring::npos) codes[j] = -1;
+            }
+            FPDF_FONT alt = StandInFont(d, refFont, base);
+            if (!alt) return false;
+            float kx = 1, ky = 1;
+            CalibrateToBox(d, origBox, own, refFont, alt, lk.tf, lk.m, kx, ky);
+            ti.standIn = StripSubsetPrefix(FontNameOf(alt));
+            if (usedFallback) *usedFallback = true;
+            auto fit = FitToOriginal(d, page, obj, refFont, O, text, ti.missing, alt, kx, ky, lk, gid, laid, &codes, &cm);
+            if (laid) return done(fit);
+            return done(PlacePieces(d, page, obj, refFont, alt, kx, ky, lk, text, ti.missing, gid, &codes));
+        }
+    }
 
     // 1. The object's own font has every character: keep the object, and its
     //    original letter positions if re-typing lost them.
@@ -1406,6 +1790,50 @@ FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPD
     FPDF_PAGEOBJECT o = make(f, ax, ay);
     std::string base = live ? BaseFontOf(styleFrom) : FontNameOf(f);
     ti.fontName = StripSubsetPrefix(base);
+    // Fonts with several glyphs per character: use the versions the neighbour
+    // uses (or the ones that match its style), not whatever the font picks.
+    if (o && live && Upright(sm)) {
+        int sp = PageOfObject(d, styleFrom, page);
+        const CodeMap& cm = CodeMapFor(d, page, f);
+        std::vector<Glyph> S = (cm.variants && sp >= 0) ? GlyphsOf(d, sp, styleFrom) : std::vector<Glyph>{};
+        if (cm.variants && sp >= 0 && cm.Ambiguous(text, S)) {
+            float sx = stf * sm.a, sy = stf * sm.d;
+            IdentifyCodes(cm, S, sx, sy);
+            std::vector<int64_t> codes = ChooseCodes(cm, S, std::vector<int>(text.size(), -1), text, sx, sy);
+            std::wstring miss;
+            bool spaceWithoutGlyph = false;
+            for (size_t j = 0; j < text.size(); ++j) {
+                if (codes[j] >= 0) continue;
+                if (iswspace(text[j])) spaceWithoutGlyph = true;
+                else if (miss.find(text[j]) == std::wstring::npos) miss += text[j];
+            }
+            if (!spaceWithoutGlyph) {
+                if (miss.empty()) {
+                    std::vector<uint32_t> cc;
+                    for (int64_t c : codes) cc.push_back((uint32_t)c);
+                    FPDFText_SetCharcodes(o, cc.data(), cc.size());
+                    ti.pieces = { o };
+                    d.ContentChanged(page);
+                    return o;
+                }
+                TextLook lk;
+                lk.m = FS_MATRIX{ ax, 0, 0, ay, px, py };
+                lk.tf = (float)visualSize;
+                lk.fr = r; lk.fg = g; lk.fb = b;
+                lk.sr = r; lk.sg = g; lk.sb = b;
+                FPDF_FONT alt = StandInFont(d, f, base);
+                float kx = 1, ky = 1;
+                CalibrateToBox(d, ObjectBounds(styleFrom), known, f, alt, stf, sm, kx, ky);
+                ti.missing = miss;
+                ti.standIn = StripSubsetPrefix(FontNameOf(alt));
+                ti.pieces = PlacePieces(d, page, o, f, alt, kx, ky, lk, text, miss, 0, &codes);
+                ti.groupId = ti.pieces.size() > 1 ? GetGroupId(ti.pieces[0]) : 0;
+                if (ti.pieces.empty()) { err = "could not create the text"; return nullptr; }
+                d.ContentChanged(page);
+                return ti.pieces[0];
+            }
+        }
+    }
     // The neighbour's font is often a subset lacking a typed letter: try the PDF's
     // other copies of that font, else draw only the missing letters in the
     // closest installed font, scaled to the neighbour's real glyph box.
