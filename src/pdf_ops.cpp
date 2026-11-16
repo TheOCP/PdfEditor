@@ -596,10 +596,21 @@ static std::string FontNameOf(FPDF_FONT f) {
 }
 static std::string BaseFontOf(FPDF_PAGEOBJECT t) { return FontNameOf(FPDFTextObj_GetFont(t)); }
 
-// Does every visible character of `want` survive a round trip through the
-// object's font? A subset font lacking a glyph maps it to nothing.
+// Does the font have a real shape for this character?
+static bool HasGlyphShape(FPDF_FONT f, wchar_t c, float size) {
+    FPDF_GLYPHPATH gp = FPDFFont_GetGlyphPath(f, (uint32_t)c, size > 0 ? size : 12.0f);
+    return gp && FPDFGlyphPath_CountGlyphSegments(gp) > 0;
+}
+
+// Can the object's font really show every visible character of `want`?
+// 1. Each must read back from the text layer (a font without it maps it to nothing).
+// 2. Each must have a shape. Subset fonts - like most bank statement fonts -
+//    still list every character in their code table but only contain the
+//    shapes of the characters the PDF uses; anything else would come out
+//    INVISIBLE. `known` is text that already renders in this font: the shape
+//    test is trusted only if all of it passes (some font types can't answer).
 static bool CharsRoundTrip(Document& d, int page, FPDF_PAGEOBJECT o, const std::wstring& want,
-                           std::wstring* missing = nullptr) {
+                           std::wstring* missing = nullptr, const std::wstring& known = {}) {
     d.ContentChanged(page);                 // bump the page version so the text page reloads
     std::wstring got = TextOf(d, page, o);
     std::map<wchar_t, int> need;
@@ -608,12 +619,56 @@ static bool CharsRoundTrip(Document& d, int page, FPDF_PAGEOBJECT o, const std::
     for (wchar_t c : got)
         if (need.count(c)) --need[c];
     bool ok = true;
+    auto lacks = [&](wchar_t c) {
+        ok = false;
+        if (missing && missing->find(c) == std::wstring::npos) *missing += c;
+    };
     for (auto& kv : need)
-        if (kv.second > 0) {
-            ok = false;
-            if (missing && missing->find(kv.first) == std::wstring::npos) *missing += kv.first;
+        if (kv.second > 0) lacks(kv.first);
+    if (known.empty()) return ok;
+
+    FPDF_FONT f = FPDFTextObj_GetFont(o);
+    float sz = 12;
+    FPDFTextObj_GetFontSize(o, &sz);
+    bool shapeTest = f != nullptr;
+    for (wchar_t c : known)
+        if (!iswspace(c) && !HasGlyphShape(f, c, sz)) { shapeTest = false; break; }
+    if (shapeTest)
+        for (wchar_t c : want)
+            if (!iswspace(c) && !HasGlyphShape(f, c, sz)) lacks(c);
+
+    // The text layer's ink box of each character (empty = nothing drawn).
+    // Ignored when every character is empty: then the font type can't tell.
+    std::wstring empty;
+    int drawn = 0;
+    if (FPDF_TEXTPAGE tp = d.TextPage(page))
+        for (int i = 0, n = FPDFText_CountChars(tp); i < n; ++i) {
+            if (FPDFText_GetTextObject(tp, i) != o || FPDFText_IsGenerated(tp, i) == 1) continue;
+            unsigned u = FPDFText_GetUnicode(tp, i);
+            if (u == ' ' || u == 0xA0 || u > 0xFFFF) continue;
+            double l = 0, r = 0, b = 0, t = 0;
+            FPDFText_GetCharBox(tp, i, &l, &r, &b, &t);
+            if (r - l < 0.01 && t - b < 0.01) empty += (wchar_t)u;
+            else ++drawn;
         }
+    if (drawn > 0)
+        for (wchar_t c : empty) lacks(c);
     return ok;
+}
+
+// Text of an object wherever it is (it may sit on another page than `prefer`).
+static std::wstring TextAnywhere(Document& d, FPDF_PAGEOBJECT obj, int prefer) {
+    if (!obj) return {};
+    int n = d.PageCount();
+    if (prefer >= 0 && prefer < n) {
+        std::wstring s = TextOf(d, prefer, obj);
+        if (!s.empty()) return s;
+    }
+    for (int pg = 0; pg < n; ++pg)
+        if (pg != prefer)
+            for (auto& o : ListObjects(d, pg))
+                if (o.obj == obj) return TextOf(d, pg, obj);
+    return {};
 }
 
 // Embedded program -> standard-14 by name -> matching installed font -> Helvetica.
@@ -656,16 +711,22 @@ static FPDF_FONT StandInFont(Document& d, FPDF_FONT ref, const std::string& base
     int weight = FPDFFont_GetWeight(ref);
     int angle = 0;
     FPDFFont_GetItalicAngle(ref, &angle);
-    std::string lname = base;
+    std::string lname = StripSubsetPrefix(base);
     for (auto& c : lname) c = (char)tolower((unsigned char)c);
+    auto has = [&](const char* w) { return lname.find(w) != std::string::npos; };
     bool mono = flags > 0 && (flags & 1);
     bool serif = flags > 0 && (flags & 2);
-    bool bold = weight >= 600 || lname.find("bold") != std::string::npos || lname.find("black") != std::string::npos;
-    bool italic = angle != 0 || (flags > 0 && (flags & 64)) || lname.find("italic") != std::string::npos ||
-                  lname.find("oblique") != std::string::npos;
-    std::string nm = mono ? "CourierNew" : serif ? "TimesNewRoman" : "Arial";
-    if (bold || italic) nm += std::string("-") + (bold ? "Bold" : "") + (italic ? "Italic" : "");
-    return LoadFontFor(d, {}, nm, true);
+    bool bold = weight >= 600 || has("bold") || has("black") || has("heavy");
+    bool light = !bold && (has("light") || has("thin") || (weight > 0 && weight <= 300));
+    bool italic = angle != 0 || (flags > 0 && (flags & 64)) || has("italic") || has("oblique");
+    // Humanist sans (Frutiger, Myriad, ...) look far more like Segoe UI, which
+    // every Windows has in Light / Regular / Bold and italics, than like Arial.
+    bool humanist = has("frutiger") || has("myriad") || has("segoe") || has("syntax") || has("opensans") ||
+                    has("sourcesans") || has("officina") || has("meta");
+    std::string fam = mono ? "CourierNew" : serif ? "TimesNewRoman" : humanist ? "SegoeUI" : "Arial";
+    std::string style = std::string(light && fam == "SegoeUI" ? "Light" : "") + (bold ? "Bold" : "") + (italic ? "Italic" : "");
+    FPDF_FONT f = LoadFontFor(d, {}, style.empty() ? fam : fam + "-" + style, true);
+    return f ? f : LoadFontFor(d, {}, "Arial", true);
 }
 
 // Everything that makes text look the way it does, apart from font and string.
@@ -815,13 +876,16 @@ static FPDF_PAGEOBJECT TryOtherCopies(Document& d, int page, FPDF_PAGEOBJECT aft
     if (!p) return nullptr;
     for (const auto& df : ListDocFonts(d, d.PageCount())) {
         if (df.name == base || StripSubsetPrefix(df.name) != fam) continue;
-        FPDF_FONT f = FindDocFont(d, df.name, page);
+        FPDF_PAGEOBJECT sample = nullptr;
+        int samplePage = page;
+        FPDF_FONT f = FindDocFont(d, df.name, page, &sample, &samplePage);
         if (!f || f == current) continue;
+        std::wstring known = sample ? TextOf(d, samplePage, sample) : std::wstring();
         FPDF_PAGEOBJECT o = NewTextObj(d, f, lk, lk.m, text);
         if (!o) continue;
         int idx = TopIndex(p, after);
         InsertAt(p, o, idx >= 0 ? idx + 1 : -1);
-        if (CharsRoundTrip(d, page, o, text)) return o;
+        if (CharsRoundTrip(d, page, o, text, nullptr, known)) return o;
         if (FPDFPage_RemoveObject(p, o)) FPDFPageObj_Destroy(o);
     }
     d.ContentChanged(page);
@@ -923,7 +987,7 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
     for (wchar_t c : text) if (c >= 0xD800 && c <= 0xDFFF) return out;
     for (const Glyph& g : O) if (g.u > 0xFFFF) return out;
     float em = lk.tf * lk.m.a;                              // one em in page units
-    float tol = std::max(0.15f, 0.025f * em);
+    float tol = std::max(0.04f, 0.004f * em);              // exact: about a third of a pixel at 100%
     auto isMissing = [&](wchar_t c) { return !iswspace(c) && missing.find(c) != std::wstring::npos; };
 
     // Which original character each typed one stands in for.
@@ -962,12 +1026,25 @@ static std::vector<FPDF_PAGEOBJECT> FitToOriginal(Document& d, int page, FPDF_PA
     std::vector<float> altW = altS.empty() ? std::vector<float>{} : MeasureAdvances(d, page, alt, lk, am, altS);
     if (ownW.size() != ownS.size() || altW.size() != altS.size()) return out;
 
+    // Width of a newly typed space: the font's own, measured between two glyphs it has.
+    float spaceW = 0.28f * em;
+    for (int j = 0; j < n; ++j) {
+        if (!iswspace(text[j]) || (match[j] >= 0 && O[match[j]].u == ' ')) continue;
+        wchar_t g = 0;
+        for (wchar_t c : text) if (!iswspace(c) && !isMissing(c)) { g = c; break; }
+        if (g) {
+            std::vector<float> sw = MeasureAdvances(d, page, font, lk, lk.m, std::wstring{ g, L' ', g });
+            if (sw.size() == 3 && sw[1] > 0.05f * em) spaceW = sw[1];
+        }
+        break;
+    }
+
     std::vector<float> adv(n, 0.0f), off(n, 0.0f), x(n, 0.0f);
     size_t oi = 0, ai = 0;
     for (int j = 0; j < n; ++j) {
         wchar_t c = text[j];
         int i = match[j];
-        if (iswspace(c)) adv[j] = (i >= 0 && O[i].u == ' ') ? O[i].w : 0.28f * em;
+        if (iswspace(c)) adv[j] = (i >= 0 && O[i].u == ' ') ? O[i].w : spaceW;
         else if (same(j)) adv[j] = O[i].w;
         else if (isMissing(c)) {
             float aw = altW[ai++];
@@ -1159,7 +1236,7 @@ bool SetObjectTextSafe(Document& d, int page, FPDF_PAGEOBJECT obj, const std::ws
 
     // 1. The object's own font has every character: keep the object, and its
     //    original letter positions if re-typing lost them.
-    if (FPDFText_SetText(obj, WS(text)) && (!verifiable || CharsRoundTrip(d, page, obj, text, &ti.missing))) {
+    if (FPDFText_SetText(obj, WS(text)) && (!verifiable || CharsRoundTrip(d, page, obj, text, &ti.missing, own))) {
         ti.missing.clear();
         auto fit = FitToOriginal(d, page, obj, refFont, O, text, L"", nullptr, 1, 1, lk, gid, laid);
         return done(laid ? fit : std::vector<FPDF_PAGEOBJECT>{ obj });
@@ -1325,13 +1402,14 @@ FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPD
             ay = std::fabs(sm.d) / s;
         }
     }
+    std::wstring known = live ? TextAnywhere(d, styleFrom, page) : std::wstring();   // renders in this font
     FPDF_PAGEOBJECT o = make(f, ax, ay);
     std::string base = live ? BaseFontOf(styleFrom) : FontNameOf(f);
     ti.fontName = StripSubsetPrefix(base);
     // The neighbour's font is often a subset lacking a typed letter: try the PDF's
     // other copies of that font, else draw only the missing letters in the
     // closest installed font, scaled to the neighbour's real glyph box.
-    if (o && !CharsRoundTrip(d, page, o, text, &ti.missing)) {
+    if (o && !CharsRoundTrip(d, page, o, text, &ti.missing, known)) {
         if (ti.missing.empty())
             for (wchar_t c : text) if (!iswspace(c) && ti.missing.find(c) == std::wstring::npos) ti.missing += c;
         TextLook lk;
@@ -1349,7 +1427,7 @@ FPDF_PAGEOBJECT AddTextLike(Document& d, int page, const std::wstring& text, FPD
         }
         FPDF_FONT alt = StandInFont(d, f, base);
         float kx = 1, ky = 1;
-        if (live) CalibrateToBox(d, ObjectBounds(styleFrom), TextOf(d, page, styleFrom), f, alt, stf, sm, kx, ky);
+        if (live) CalibrateToBox(d, ObjectBounds(styleFrom), known, f, alt, stf, sm, kx, ky);
         else MatchFontMetrics(d, f, alt, (float)visualSize, text, kx, ky);
         ti.standIn = StripSubsetPrefix(FontNameOf(alt));
         ti.pieces = PlacePieces(d, page, o, f, alt, kx, ky, lk, text, ti.missing, 0);
