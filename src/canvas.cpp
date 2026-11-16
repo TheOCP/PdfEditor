@@ -281,7 +281,7 @@ static void SelectLeaves(App& a, int pg, bool linesOnly, const PRect* within) {
     std::vector<FPDF_PAGEOBJECT> pick, nested;
     for (auto& o : ops::ListObjects(a.doc, pg)) {
         if (o.type == FPDF_PAGEOBJ_FORM) continue;
-        if (linesOnly && o.type != FPDF_PAGEOBJ_PATH) continue;
+        if (linesOnly && !ops::IsLine(o.obj)) continue;      // real lines only, however drawn
         if (within && !o.bounds.Intersects(*within)) continue;
         pick.push_back(o.obj);
         if (o.parent) nested.push_back(o.obj);

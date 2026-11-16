@@ -1,0 +1,16 @@
+# Gradle / Android Studio / native build output
+.gradle/
+.kotlin/
+build/
+app/build/
+app/.cxx/
+.idea/
+*.iml
+captures/
+
+# Machine-specific and secret files - never commit
+local.properties
+keystore.properties
+*.keystore
+*.jks
+*.orig
